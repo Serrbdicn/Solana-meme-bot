@@ -1,0 +1,5 @@
+python-telegram-bot>=21.0,<23
+httpx>=0.27,<0.29
+websockets>=13,<16
+feedparser>=6.0,<7
+python-dotenv>=1.0,<2
