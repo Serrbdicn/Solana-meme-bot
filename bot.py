@@ -28,7 +28,11 @@ MAX_AGE = int(os.getenv("MAX_LAUNCH_AGE_SECONDS", "3600"))
 MIN_SCORE = float(os.getenv("MIN_SECURITY_SCORE", "5"))
 POLL = int(os.getenv("POLL_SECONDS", "15"))
 SOL_PRICE_REFRESH_SECONDS = 90
-MARKET_REFRESH_SECONDS = 60
+MARKET_REFRESH_SECONDS = 30
+# Paid PumpPortal trade streams are intentionally disabled. The AUD amount is
+# a planning ceiling, NOT a provider-side payment limit.
+PAID_STREAM_ENABLED = False
+PAID_STREAM_BUDGET_AUD = 5.0
 RSS = [u.strip() for u in os.getenv("RSS_URLS", "").split(",") if u.strip()]
 DB = Path("data/bot.db")
 DB.parent.mkdir(exist_ok=True)
@@ -55,13 +59,14 @@ def init_db():
           mint TEXT PRIMARY KEY, name TEXT, symbol TEXT, first_seen REAL,
           created_at REAL, cap REAL, security REAL, potential REAL,
           category TEXT, state TEXT, reason TEXT, updated_at REAL,
-          launch_cap_sol REAL, cap_source TEXT, cap_observed_at REAL);
+          launch_cap_sol REAL, cap_source TEXT, cap_observed_at REAL,
+          threshold_alerted_at REAL);
         CREATE TABLE IF NOT EXISTS news (
           url TEXT PRIMARY KEY, title TEXT, published REAL, fetched REAL);
         CREATE TABLE IF NOT EXISTS watchlist (handle TEXT PRIMARY KEY);
         """)
         columns = {r[1] for r in db.execute("PRAGMA table_info(tokens)")}
-        for name, dtype in (("launch_cap_sol", "REAL"), ("cap_source", "TEXT"), ("cap_observed_at", "REAL")):
+        for name, dtype in (("launch_cap_sol", "REAL"), ("cap_source", "TEXT"), ("cap_observed_at", "REAL"), ("threshold_alerted_at", "REAL")):
             if name not in columns:
                 db.execute(f"ALTER TABLE tokens ADD COLUMN {name} {dtype}")
 
@@ -311,6 +316,22 @@ async def worker(application, queue):
                     db.execute(
                         "UPDATE tokens SET cap=?,cap_source=?,cap_observed_at=?,updated_at=?,state='WAIT_CAP' WHERE mint=?",
                         (cap, source, time.time() if cap is not None else None, time.time(), mint))
+                # Notify once per mint when a recent DEX market-cap observation
+                # first reaches the configured threshold. This is a market-data
+                # alert only, NOT a security approval or a trading signal.
+                if source == "DEX provider (recent poll)" and cap >= CAP and row["threshold_alerted_at"] is None:
+                    with conn() as db:
+                        updated = db.execute(
+                            "UPDATE tokens SET threshold_alerted_at=? WHERE mint=? AND threshold_alerted_at IS NULL",
+                            (time.time(), mint)).rowcount
+                    if updated:
+                        await application.bot.send_message(
+                            CHAT_ID,
+                            f"MARKET-CAP WATCH (UNVERIFIED)\n"
+                            f"{row['name']} ({row['symbol']})\n"
+                            f"Provider-reported cap: US${cap:,.0f} (recent DEX poll)\n"
+                            f"Crossing time and launch age NOT confirmed. Security NOT cleared.\n"
+                            f"Mint: {mint}")
                 # Only a current DEX observation can trigger further screening here.
                 # Launch snapshots are displayed for research but never treated as
                 # proof that a token has NOW crossed US$10,000.
