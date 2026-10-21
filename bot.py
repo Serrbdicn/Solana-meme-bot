@@ -4,6 +4,7 @@ import contextlib
 import datetime as dt
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
@@ -34,8 +35,8 @@ MARKET_REFRESH_SECONDS = 30
 PAID_STREAM_ENABLED = False
 PAID_STREAM_BUDGET_AUD = 5.0
 RSS = [u.strip() for u in os.getenv("RSS_URLS", "").split(",") if u.strip()]
-DB = Path("data/bot.db")
-DB.parent.mkdir(exist_ok=True)
+DB = Path(os.getenv("BOT_DB_PATH", "data/bot.db"))
+DB.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("screener")
 
@@ -124,14 +125,57 @@ async def check_authorities(client, mint):
 
 
 async def market(client, mint):
+    """Return only a Solana pair whose BASE mint matches exactly."""
     try:
         r = await client.get(f"https://api.dexscreener.com/token-pairs/v1/solana/{mint}", timeout=10)
         r.raise_for_status()
-        pairs = r.json()
-        pairs = [p for p in pairs if p.get("baseToken", {}).get("address") == mint]
-        return max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0) if pairs else None
+        payload = r.json()
+        if not isinstance(payload, list):
+            return None
+        pairs = [p for p in payload if isinstance(p, dict)
+                 and p.get("chainId") == "solana"
+                 and isinstance(p.get("baseToken"), dict)
+                 and p["baseToken"].get("address") == mint]
+        return max(pairs, key=lambda p: safe_number((p.get("liquidity") or {}).get("usd")) or 0) if pairs else None
     except (httpx.HTTPError, ValueError, TypeError):
         return None
+
+
+def safe_number(value):
+    """Reject bools, NaN, infinities, and negative provider numbers."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    value = float(value)
+    return value if math.isfinite(value) and value >= 0 else None
+
+
+def market_warnings(pair, cap):
+    """Heuristic red flags, not proof of fraud or a complete security audit."""
+    flags = []
+    if cap is None:
+        return flags
+    if cap >= 1_000_000_000:
+        flags.append("EXTREME valuation (>= US$1B); verify pricing and supply")
+    elif cap >= 100_000_000:
+        flags.append("Very high valuation (>= US$100M); investigate")
+    liquidity = safe_number((pair.get("liquidity") or {}).get("usd")) if pair else None
+    if liquidity is None:
+        flags.append("DEX liquidity unknown")
+    elif liquidity == 0:
+        flags.append("Zero reported DEX liquidity")
+    elif cap / liquidity >= 1000:
+        flags.append(f"EXTREME cap/liquidity ratio ({cap / liquidity:,.0f}x)")
+    elif cap / liquidity >= 100:
+        flags.append(f"High cap/liquidity ratio ({cap / liquidity:,.0f}x)")
+    return flags
+
+
+def risk_label(flags):
+    if any("EXTREME" in flag or "Zero reported" in flag for flag in flags):
+        return "HIGH RISK FLAG"
+    if flags:
+        return "CAUTION"
+    return "NO VALUATION FLAGS (security unverified)"
 
 
 async def sol_usd_price(client):
@@ -154,8 +198,9 @@ def provider_cap(pair):
     if not pair:
         return None
     cap = pair.get("marketCap")
-    if isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap > 0:
-        return float(cap)
+    cap = safe_number(cap)
+    if cap is not None and cap > 0:
+        return cap
     return None
 
 
@@ -206,10 +251,16 @@ async def inspect(client, mint, record, headlines):
     if pair is None:
         flags.append("No indexed DEX market yet")
     else:
-        liquidity = (pair.get("liquidity") or {}).get("usd")
+        liquidity = safe_number((pair.get("liquidity") or {}).get("usd"))
         if liquidity is not None and liquidity < 3000:
             score -= 2
             flags.append("Low reported DEX liquidity")
+        valuation_flags = market_warnings(pair, provider_cap(pair))
+        flags.extend(valuation_flags)
+        if any("EXTREME" in f or "Zero reported" in f for f in valuation_flags):
+            score -= 3
+        elif valuation_flags:
+            score -= 1
     # Do not assert liquidity burn, sellability, holder clusters, or candle safety.
     critical_unknown = True
     flags.append("LP security, sellability and manipulation checks NOT implemented")
@@ -297,7 +348,7 @@ async def worker(application, queue):
             # Avoid excessive provider polling: cap checks are spaced per token.
             with conn() as db:
                 rows = db.execute(
-                    "SELECT * FROM tokens WHERE state IN ('NEW','WAIT_CAP') "
+                    "SELECT * FROM tokens WHERE state IN ('NEW','WAIT_CAP','HOLD','REJECT') "
                     "AND first_seen>? AND (updated_at IS NULL OR updated_at<?) "
                     "ORDER BY COALESCE(updated_at,0) ASC LIMIT 12",
                     (time.time() - MAX_AGE, time.time() - MARKET_REFRESH_SECONDS)).fetchall()
@@ -316,6 +367,7 @@ async def worker(application, queue):
                     db.execute(
                         "UPDATE tokens SET cap=?,cap_source=?,cap_observed_at=?,updated_at=?,state='WAIT_CAP' WHERE mint=?",
                         (cap, source, time.time() if cap is not None else None, time.time(), mint))
+                valuation_flags = market_warnings(pair, dex_cap) if dex_cap is not None else []
                 # Notify once per mint when a recent DEX market-cap observation
                 # first reaches the configured threshold. This is a market-data
                 # alert only, NOT a security approval or a trading signal.
@@ -330,7 +382,9 @@ async def worker(application, queue):
                             f"MARKET-CAP WATCH (UNVERIFIED)\n"
                             f"{row['name']} ({row['symbol']})\n"
                             f"Provider-reported cap: US${cap:,.0f} (recent DEX poll)\n"
-                            f"Crossing time and launch age NOT confirmed. Security NOT cleared.\n"
+                            f"Valuation risk: {risk_label(valuation_flags)}\n"
+                            + ("; ".join(valuation_flags) + "\n" if valuation_flags else "")
+                            + f"Crossing time and launch age NOT confirmed. Security NOT cleared.\n"
                             f"Mint: {mint}")
                 # Only a current DEX observation can trigger further screening here.
                 # Launch snapshots are displayed for research but never treated as
@@ -392,6 +446,9 @@ async def new_discoveries(update: Update, context: ContextTypes.DEFAULT_TYPE):
         observed = row["cap_observed_at"]
         cap_age = f"; sampled {int((now-observed)/60)}m ago" if observed else ""
         cap_text += f" [{source}{cap_age}]"
+        # Stored risk notes are derived from the latest screening, not a fresh quote.
+        risk_note = (row["reason"] or "")
+        risk_note = "HIGH RISK FLAG" if "EXTREME" in risk_note else ("CAUTION" if "valuation" in risk_note.lower() or "ratio" in risk_note.lower() else "")
         state = row['state'] or 'NEW'
         if state == 'WAIT_CAP':
             warning = "Threshold not confirmed with current market data; not security-cleared"
@@ -409,7 +466,8 @@ async def new_discoveries(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{index}. {name} ({symbol})\n"
             f"Cap: {cap_text} | Seen: {age_minutes}m ago\n"
             f"State: {state} — {warning}\n"
-            f"Mint: {row['mint']}"
+            + (f"Valuation: {risk_note} (last screening)\n" if risk_note else "")
+            + f"Mint: {row['mint']}"
         )
     await update.message.reply_text(
         "EARLY DISCOVERIES — UNVERIFIED\n"
@@ -443,9 +501,47 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with conn() as db:
         row = db.execute("SELECT * FROM tokens WHERE mint=?", (mint,)).fetchone()
     if not row:
-        await update.message.reply_text("Not observed in this bot's Pump.fun launch feed; cannot verify launch age or origin. No rating given.")
-    else:
-        await update.message.reply_text(f"{row['name']} (${row['symbol']})\nState: {row['state']}\nMarket cap: {row['cap']} USD ({row['cap_source'] or 'unavailable'})\nSecurity: {row['security']}/10\nPotential: {row['potential']}/10\nCategory: {row['category']}\n{row['reason'] or 'Awaiting data'}\nMint: {mint}")
+        # A Render restart can remove the ephemeral SQLite database. Never claim
+        # that an external lookup proves the token was observed at launch.
+        async with httpx.AsyncClient() as client:
+            pair = await market(client, mint)
+        if not pair:
+            await update.message.reply_text(
+                "Not in this bot's local launch history, and no matching Solana DEX pair was found. "
+                "Launch age and security cannot be verified."
+            )
+            return
+        cap = provider_cap(pair)
+        flags = market_warnings(pair, cap)
+        name = (pair.get("baseToken") or {}).get("name") or "Unknown"
+        symbol = (pair.get("baseToken") or {}).get("symbol") or "?"
+        await update.message.reply_text(
+            f"EXTERNAL LOOKUP ONLY (not in local launch history)\n"
+            f"{name} ({symbol})\n"
+            f"Provider market cap: {f'US${cap:,.0f}' if cap is not None else 'unknown'}\n"
+            f"Valuation: {risk_label(flags)}\n"
+            f"{'; '.join(flags) if flags else 'No valuation red flags identified'}\n"
+            f"Launch age NOT verified; security NOT cleared.\nMint: {mint}"
+        )
+        return
+    async with httpx.AsyncClient() as client:
+        pair = await market(client, mint)
+    live_cap = provider_cap(pair)
+    flags = market_warnings(pair, live_cap)
+    stored_cap = f"US${row['cap']:,.0f}" if row['cap'] is not None else "unknown"
+    await update.message.reply_text(
+        f"{row['name']} ({row['symbol']})\n"
+        f"State: {row['state']}\n"
+        f"Stored cap: {stored_cap} ({row['cap_source'] or 'unavailable'})\n"
+        f"Latest DEX cap: {f'US${live_cap:,.0f}' if live_cap is not None else 'unavailable'}\n"
+        f"Valuation: {risk_label(flags)}\n"
+        f"{'; '.join(flags) if flags else 'No valuation red flags identified'}\n"
+        f"Security: {row['security'] if row['security'] is not None else 'unverified'}/10\n"
+        f"Potential: {row['potential'] if row['potential'] is not None else 'unverified'}/10\n"
+        f"Category: {row['category'] or 'unclassified'}\n"
+        f"{row['reason'] or 'Awaiting checks'}\n"
+        f"Mint: {mint}"
+    )
 
 
 async def accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
