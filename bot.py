@@ -270,7 +270,7 @@ def authorized(update):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if authorized(update):
-        await update.message.reply_text("Pump.fun research bot online. /status /top /news /viral /phrases /original /culture /remix /check <mint> /accounts /addaccount <handle> /removeaccount <handle>\n\nHOLD means critical security checks are unverified. No trading.")
+        await update.message.reply_text("Pump.fun research bot online. /new (early discoveries, NOT verified) /status /top /news /viral /phrases /original /culture /remix /check <mint> /accounts /addaccount <handle> /removeaccount <handle>\n\nHOLD means critical security checks are unverified. No trading.")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -278,6 +278,53 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with conn() as db:
         rows = db.execute("SELECT state,COUNT(*) n FROM tokens GROUP BY state").fetchall()
     await update.message.reply_text("States: " + (", ".join(f"{r['state']}={r['n']}" for r in rows) or "none") + "\nA$100 total risk budget. Research only.")
+
+
+async def new_discoveries(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Recent feed observations, including unverified/under-threshold tokens."""
+    if not authorized(update):
+        return
+    now = time.time()
+    with conn() as db:
+        rows = db.execute(
+            "SELECT * FROM tokens WHERE first_seen >= ? AND state != 'EXPIRED' "
+            "ORDER BY first_seen DESC LIMIT 10", (now - MAX_AGE,)
+        ).fetchall()
+    if not rows:
+        await update.message.reply_text(
+            "No recent tokens in the local launch feed yet. Check /status. "
+            "This is not evidence that Pump.fun has no launches."
+        )
+        return
+    entries = []
+    for index, row in enumerate(rows, 1):
+        age_minutes = max(0, int((now - row['first_seen']) / 60))
+        cap = row['cap']
+        cap_text = f"US${cap:,.0f} (DEX provider-reported)" if cap is not None else "unknown"
+        state = row['state'] or 'NEW'
+        if state == 'WAIT_CAP':
+            warning = "Below threshold or market cap unavailable; not security-cleared"
+        elif state == 'HOLD':
+            warning = "Security verification incomplete; NOT cleared"
+        elif state == 'REJECT':
+            warning = "Failed preliminary screening; NOT cleared"
+        elif state == 'PASS':
+            warning = "Passed configured checks (review evidence independently)"
+        else:
+            warning = "Awaiting market data and screening; NOT cleared"
+        name = (row['name'] or 'Unnamed').replace('\n', ' ')[:55]
+        symbol = (row['symbol'] or '?').replace('\n', ' ')[:18]
+        entries.append(
+            f"{index}. {name} ({symbol})\n"
+            f"Cap: {cap_text} | Seen: {age_minutes}m ago\n"
+            f"State: {state} — {warning}\n"
+            f"Mint: {row['mint']}"
+        )
+    await update.message.reply_text(
+        "EARLY DISCOVERIES — UNVERIFIED\n"
+        "Sorted by time first seen by this bot, NOT verified token age. "
+        "A listing is NOT a buy signal.\n\n" + "\n\n".join(entries)
+    )
 
 
 async def ranking(update: Update, context: ContextTypes.DEFAULT_TYPE, category=None):
@@ -354,6 +401,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("top", ranking))
+    application.add_handler(CommandHandler("new", new_discoveries))
     for key in CATEGORIES:
         async def handler(update, context, category=key):
             await ranking(update, context, category)
