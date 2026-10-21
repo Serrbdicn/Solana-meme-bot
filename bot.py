@@ -27,6 +27,8 @@ CAP = float(os.getenv("MIN_MARKET_CAP_USD", "10000"))
 MAX_AGE = int(os.getenv("MAX_LAUNCH_AGE_SECONDS", "3600"))
 MIN_SCORE = float(os.getenv("MIN_SECURITY_SCORE", "5"))
 POLL = int(os.getenv("POLL_SECONDS", "15"))
+SOL_PRICE_REFRESH_SECONDS = 90
+MARKET_REFRESH_SECONDS = 60
 RSS = [u.strip() for u in os.getenv("RSS_URLS", "").split(",") if u.strip()]
 DB = Path("data/bot.db")
 DB.parent.mkdir(exist_ok=True)
@@ -52,11 +54,16 @@ def init_db():
         CREATE TABLE IF NOT EXISTS tokens (
           mint TEXT PRIMARY KEY, name TEXT, symbol TEXT, first_seen REAL,
           created_at REAL, cap REAL, security REAL, potential REAL,
-          category TEXT, state TEXT, reason TEXT, updated_at REAL);
+          category TEXT, state TEXT, reason TEXT, updated_at REAL,
+          launch_cap_sol REAL, cap_source TEXT, cap_observed_at REAL);
         CREATE TABLE IF NOT EXISTS news (
           url TEXT PRIMARY KEY, title TEXT, published REAL, fetched REAL);
         CREATE TABLE IF NOT EXISTS watchlist (handle TEXT PRIMARY KEY);
         """)
+        columns = {r[1] for r in db.execute("PRAGMA table_info(tokens)")}
+        for name, dtype in (("launch_cap_sol", "REAL"), ("cap_source", "TEXT"), ("cap_observed_at", "REAL")):
+            if name not in columns:
+                db.execute(f"ALTER TABLE tokens ADD COLUMN {name} {dtype}")
 
 
 def words(s):
@@ -120,6 +127,31 @@ async def market(client, mint):
         return max(pairs, key=lambda p: (p.get("liquidity") or {}).get("usd") or 0) if pairs else None
     except (httpx.HTTPError, ValueError, TypeError):
         return None
+
+
+async def sol_usd_price(client):
+    """Independent spot price; return None rather than guessing on failure."""
+    try:
+        r = await client.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "solana", "vs_currencies": "usd"}, timeout=10)
+        r.raise_for_status()
+        price = r.json().get("solana", {}).get("usd")
+        if isinstance(price, (int, float)) and not isinstance(price, bool) and 0 < price < 100000:
+            return float(price)
+    except (httpx.HTTPError, ValueError, TypeError, AttributeError):
+        pass
+    return None
+
+
+def provider_cap(pair):
+    """Use provider market cap, never FDV as a silent substitute."""
+    if not pair:
+        return None
+    cap = pair.get("marketCap")
+    if isinstance(cap, (int, float)) and not isinstance(cap, bool) and cap > 0:
+        return float(cap)
+    return None
 
 
 async def largest_accounts(client, mint):
@@ -223,42 +255,76 @@ async def launch_stream(queue):
 async def worker(application, queue):
     async with httpx.AsyncClient() as client:
         headlines = []
-        last_news = 0
+        last_news = 0.0
+        last_sol_check = 0.0
+        sol_price = None
+        sol_price_at = 0.0
         while True:
-            if time.time() - last_news > 300:
+            now = time.time()
+            if now - last_news > 300:
                 headlines = await fetch_headlines(client)
-                last_news = time.time()
+                last_news = now
+            if now - last_sol_check >= SOL_PRICE_REFRESH_SECONDS:
+                last_sol_check = now
+                candidate_price = await sol_usd_price(client)
+                if candidate_price is not None:
+                    sol_price, sol_price_at = candidate_price, time.time()
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=POLL)
             except asyncio.TimeoutError:
                 event = None
             if event:
                 mint = event["mint"]
+                raw_cap = event.get("marketCapSol")
+                cap_sol = (float(raw_cap) if isinstance(raw_cap, (int, float))
+                           and not isinstance(raw_cap, bool) and 0 < raw_cap < 100000000 else None)
+                observed = time.time()
+                # The launch snapshot is not a live market cap and not proof of crossing the threshold.
                 with conn() as db:
-                    db.execute("INSERT OR IGNORE INTO tokens(mint,name,symbol,first_seen,state) VALUES(?,?,?,?,?)",
-                               (mint, str(event.get("name", ""))[:100], str(event.get("symbol", ""))[:30], time.time(), "NEW"))
+                    db.execute(
+                        "INSERT OR IGNORE INTO tokens(mint,name,symbol,first_seen,state,launch_cap_sol) VALUES(?,?,?,?,?,?)",
+                        (mint, str(event.get("name", ""))[:100],
+                         str(event.get("symbol", ""))[:30], observed, "NEW", cap_sol))
+                    if cap_sol is not None:
+                        db.execute("UPDATE tokens SET launch_cap_sol=COALESCE(launch_cap_sol, ?) WHERE mint=?",
+                                   (cap_sol, mint))
                 queue.task_done()
+            # Avoid excessive provider polling: cap checks are spaced per token.
             with conn() as db:
-                rows = db.execute("SELECT * FROM tokens WHERE state IN ('NEW','WAIT_CAP') AND first_seen>? ORDER BY first_seen DESC LIMIT 25",
-                                  (time.time() - MAX_AGE,)).fetchall()
+                rows = db.execute(
+                    "SELECT * FROM tokens WHERE state IN ('NEW','WAIT_CAP') "
+                    "AND first_seen>? AND (updated_at IS NULL OR updated_at<?) "
+                    "ORDER BY COALESCE(updated_at,0) ASC LIMIT 12",
+                    (time.time() - MAX_AGE, time.time() - MARKET_REFRESH_SECONDS)).fetchall()
             for row in rows:
                 mint = row["mint"]
                 pair = await market(client, mint)
-                # DexScreener's marketCap may be missing or may reflect a different methodology.
-                cap = (pair or {}).get("marketCap")
-                if not isinstance(cap, (int, float)) or cap < CAP:
-                    with conn() as db:
-                        db.execute("UPDATE tokens SET state='WAIT_CAP',cap=?,updated_at=? WHERE mint=?",
-                                   (cap, time.time(), mint))
+                dex_cap = provider_cap(pair)
+                cap, source = None, None
+                # Prefer a recently fetched DEX provider observation over the launch snapshot.
+                if dex_cap is not None:
+                    cap, source = dex_cap, "DEX provider (recent poll)"
+                elif row["launch_cap_sol"] is not None and sol_price is not None and time.time() - sol_price_at < 300:
+                    cap = float(row["launch_cap_sol"]) * sol_price
+                    source = "PumpPortal LAUNCH snapshot x SOL/USD (NOT live)"
+                with conn() as db:
+                    db.execute(
+                        "UPDATE tokens SET cap=?,cap_source=?,cap_observed_at=?,updated_at=?,state='WAIT_CAP' WHERE mint=?",
+                        (cap, source, time.time() if cap is not None else None, time.time(), mint))
+                # Only a current DEX observation can trigger further screening here.
+                # Launch snapshots are displayed for research but never treated as
+                # proof that a token has NOW crossed US$10,000.
+                if source != "DEX provider (recent poll)" or cap < CAP:
                     continue
-                # Verify chain creation time via first launch signature if present; absent = hold.
-                # We do not infer creation time from the bot's receipt timestamp.
                 score, potential, category, state, reason = await inspect(client, mint, row, headlines)
                 with conn() as db:
-                    db.execute("UPDATE tokens SET cap=?,security=?,potential=?,category=?,state=?,reason=?,updated_at=? WHERE mint=?",
-                               (cap, score, potential, category, state, reason, time.time(), mint))
+                    db.execute(
+                        "UPDATE tokens SET security=?,potential=?,category=?,state=?,reason=?,updated_at=? WHERE mint=?",
+                        (score, potential, category, state, reason, time.time(), mint))
                 if state == "PASS":
-                    await application.bot.send_message(CHAT_ID, f"Candidate {row['name']} ({row['symbol']})\nSecurity {score}/10 | Potential {potential}/10\n{mint}")
+                    await application.bot.send_message(
+                        CHAT_ID, f"Candidate {row['name']} ({row['symbol']})\n"
+                        f"Security {score}/10 | Potential {potential}/10\n{mint}")
             with conn() as db:
                 db.execute("UPDATE tokens SET state='EXPIRED' WHERE first_seen<? AND state IN ('NEW','WAIT_CAP')",
                            (time.time() - MAX_AGE,))
@@ -270,7 +336,7 @@ def authorized(update):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if authorized(update):
-        await update.message.reply_text("Pump.fun research bot online. /new (early discoveries, NOT verified) /status /top /news /viral /phrases /original /culture /remix /check <mint> /accounts /addaccount <handle> /removeaccount <handle>\n\nHOLD means critical security checks are unverified. No trading.")
+        await update.message.reply_text("Pump.fun research bot online. /new (early discoveries; launch cap estimates are NOT live or verified) /status /top /news /viral /phrases /original /culture /remix /check <mint> /accounts /addaccount <handle> /removeaccount <handle>\n\nHOLD means critical security checks are unverified. No trading.")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -300,10 +366,14 @@ async def new_discoveries(update: Update, context: ContextTypes.DEFAULT_TYPE):
     for index, row in enumerate(rows, 1):
         age_minutes = max(0, int((now - row['first_seen']) / 60))
         cap = row['cap']
-        cap_text = f"US${cap:,.0f} (DEX provider-reported)" if cap is not None else "unknown"
+        cap_text = f"US${cap:,.0f}" if cap is not None else "unknown"
+        source = row["cap_source"] or "No verified market data"
+        observed = row["cap_observed_at"]
+        cap_age = f"; sampled {int((now-observed)/60)}m ago" if observed else ""
+        cap_text += f" [{source}{cap_age}]"
         state = row['state'] or 'NEW'
         if state == 'WAIT_CAP':
-            warning = "Below threshold or market cap unavailable; not security-cleared"
+            warning = "Threshold not confirmed with current market data; not security-cleared"
         elif state == 'HOLD':
             warning = "Security verification incomplete; NOT cleared"
         elif state == 'REJECT':
@@ -354,7 +424,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not row:
         await update.message.reply_text("Not observed in this bot's Pump.fun launch feed; cannot verify launch age or origin. No rating given.")
     else:
-        await update.message.reply_text(f"{row['name']} (${row['symbol']})\nState: {row['state']}\nMarket cap: {row['cap']} USD (provider reported)\nSecurity: {row['security']}/10\nPotential: {row['potential']}/10\nCategory: {row['category']}\n{row['reason'] or 'Awaiting data'}\nMint: {mint}")
+        await update.message.reply_text(f"{row['name']} (${row['symbol']})\nState: {row['state']}\nMarket cap: {row['cap']} USD ({row['cap_source'] or 'unavailable'})\nSecurity: {row['security']}/10\nPotential: {row['potential']}/10\nCategory: {row['category']}\n{row['reason'] or 'Awaiting data'}\nMint: {mint}")
 
 
 async def accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
