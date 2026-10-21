@@ -16,7 +16,7 @@ import feedparser
 import httpx
 import websockets
 from dotenv import load_dotenv
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 load_dotenv()
@@ -61,15 +61,36 @@ def init_db():
           created_at REAL, cap REAL, security REAL, potential REAL,
           category TEXT, state TEXT, reason TEXT, updated_at REAL,
           launch_cap_sol REAL, cap_source TEXT, cap_observed_at REAL,
-          threshold_alerted_at REAL);
+          threshold_alerted_at REAL, creator TEXT);
         CREATE TABLE IF NOT EXISTS news (
           url TEXT PRIMARY KEY, title TEXT, published REAL, fetched REAL);
         CREATE TABLE IF NOT EXISTS watchlist (handle TEXT PRIMARY KEY);
         """)
         columns = {r[1] for r in db.execute("PRAGMA table_info(tokens)")}
-        for name, dtype in (("launch_cap_sol", "REAL"), ("cap_source", "TEXT"), ("cap_observed_at", "REAL"), ("threshold_alerted_at", "REAL")):
+        for name, dtype in (("launch_cap_sol", "REAL"), ("cap_source", "TEXT"), ("cap_observed_at", "REAL"), ("threshold_alerted_at", "REAL"), ("creator", "TEXT")):
             if name not in columns:
                 db.execute(f"ALTER TABLE tokens ADD COLUMN {name} {dtype}")
+
+
+def creator_launch_count(creator, exclude_mint=None):
+    """Count launches observed by THIS bot only; not on-chain creator history."""
+    if not creator:
+        return None
+    with conn() as db:
+        if exclude_mint:
+            return db.execute("SELECT COUNT(*) FROM tokens WHERE creator=? AND mint!=?", (creator, exclude_mint)).fetchone()[0]
+        return db.execute("SELECT COUNT(*) FROM tokens WHERE creator=?", (creator,)).fetchone()[0]
+
+
+def creator_risk_note(creator, mint):
+    count = creator_launch_count(creator, mint)
+    if count is None:
+        return "Creator wallet unknown; creator-history checks unavailable"
+    if count >= 5:
+        return f"HIGH RISK FLAG: creator has {count} other launches observed by this bot (not proof of fraud)"
+    if count >= 2:
+        return f"CAUTION: creator has {count} other launches observed by this bot"
+    return f"Creator wallet observed; {count} other local launches (external history NOT checked)"
 
 
 def words(s):
@@ -261,6 +282,13 @@ async def inspect(client, mint, record, headlines):
             score -= 3
         elif valuation_flags:
             score -= 1
+    creator_note = creator_risk_note(record["creator"] if "creator" in record.keys() else None, mint)
+    flags.append(creator_note)
+    if creator_note.startswith("HIGH RISK"):
+        score -= 3
+    elif creator_note.startswith("CAUTION"):
+        score -= 1
+    # Holder concentration counts token accounts, not beneficial owners or linked wallets.
     # Do not assert liquidity burn, sellability, holder clusters, or candle safety.
     critical_unknown = True
     flags.append("LP security, sellability and manipulation checks NOT implemented")
@@ -338,12 +366,17 @@ async def worker(application, queue):
                 # The launch snapshot is not a live market cap and not proof of crossing the threshold.
                 with conn() as db:
                     db.execute(
-                        "INSERT OR IGNORE INTO tokens(mint,name,symbol,first_seen,state,launch_cap_sol) VALUES(?,?,?,?,?,?)",
+                        "INSERT OR IGNORE INTO tokens(mint,name,symbol,first_seen,state,launch_cap_sol,creator) VALUES(?,?,?,?,?,?,?)",
                         (mint, str(event.get("name", ""))[:100],
-                         str(event.get("symbol", ""))[:30], observed, "NEW", cap_sol))
+                         str(event.get("symbol", ""))[:30], observed, "NEW", cap_sol,
+                         event.get("traderPublicKey") if isinstance(event.get("traderPublicKey"), str)
+                         and re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", event["traderPublicKey"]) else None))
                     if cap_sol is not None:
                         db.execute("UPDATE tokens SET launch_cap_sol=COALESCE(launch_cap_sol, ?) WHERE mint=?",
                                    (cap_sol, mint))
+                    creator = event.get("traderPublicKey")
+                    if isinstance(creator, str) and re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", creator):
+                        db.execute("UPDATE tokens SET creator=COALESCE(creator, ?) WHERE mint=?", (creator, mint))
                 queue.task_done()
             # Avoid excessive provider polling: cap checks are spaced per token.
             with conn() as db:
@@ -368,6 +401,7 @@ async def worker(application, queue):
                         "UPDATE tokens SET cap=?,cap_source=?,cap_observed_at=?,updated_at=?,state='WAIT_CAP' WHERE mint=?",
                         (cap, source, time.time() if cap is not None else None, time.time(), mint))
                 valuation_flags = market_warnings(pair, dex_cap) if dex_cap is not None else []
+                creator_note = creator_risk_note(row["creator"], mint)
                 # Notify once per mint when a recent DEX market-cap observation
                 # first reaches the configured threshold. This is a market-data
                 # alert only, NOT a security approval or a trading signal.
@@ -383,9 +417,11 @@ async def worker(application, queue):
                             f"{row['name']} ({row['symbol']})\n"
                             f"Provider-reported cap: US${cap:,.0f} (recent DEX poll)\n"
                             f"Valuation risk: {risk_label(valuation_flags)}\n"
+                            f"Creator: {creator_note}\n"
                             + ("; ".join(valuation_flags) + "\n" if valuation_flags else "")
                             + f"Crossing time and launch age NOT confirmed. Security NOT cleared.\n"
-                            f"Mint: {mint}")
+                            f"Mint: {mint}",
+                            reply_markup=mint_keyboard(mint))
                 # Only a current DEX observation can trigger further screening here.
                 # Launch snapshots are displayed for research but never treated as
                 # proof that a token has NOW crossed US$10,000.
@@ -403,6 +439,21 @@ async def worker(application, queue):
             with conn() as db:
                 db.execute("UPDATE tokens SET state='EXPIRED' WHERE first_seen<? AND state IN ('NEW','WAIT_CAP')",
                            (time.time() - MAX_AGE,))
+
+
+
+def mint_keyboard(mint):
+    """Telegram Bot API copy-text button (Bot API 7.11+).
+
+    api_kwargs supports the wire field even with older python-telegram-bot
+    versions, so requirements.txt need not change. Requires a Telegram client
+    that supports copy-text buttons.
+    """
+    button = InlineKeyboardButton(
+        "📋 Copy Mint",
+        api_kwargs={"copy_text": {"text": mint}},
+    )
+    return InlineKeyboardMarkup([[button]])
 
 
 def authorized(update):
@@ -437,7 +488,11 @@ async def new_discoveries(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "This is not evidence that Pump.fun has no launches."
         )
         return
-    entries = []
+    await update.message.reply_text(
+        "EARLY DISCOVERIES — UNVERIFIED\n"
+        "Sorted by time first seen by this bot, NOT verified token age. "
+        "A listing is NOT a buy signal. Tap Copy Mint to copy just the address."
+    )
     for index, row in enumerate(rows, 1):
         age_minutes = max(0, int((now - row['first_seen']) / 60))
         cap = row['cap']
@@ -448,7 +503,7 @@ async def new_discoveries(update: Update, context: ContextTypes.DEFAULT_TYPE):
         cap_text += f" [{source}{cap_age}]"
         # Stored risk notes are derived from the latest screening, not a fresh quote.
         risk_note = (row["reason"] or "")
-        risk_note = "HIGH RISK FLAG" if "EXTREME" in risk_note else ("CAUTION" if "valuation" in risk_note.lower() or "ratio" in risk_note.lower() else "")
+        risk_note = "HIGH RISK FLAG" if "EXTREME" in risk_note or "HIGH RISK FLAG" in risk_note else ("CAUTION" if "valuation" in risk_note.lower() or "ratio" in risk_note.lower() or "CAUTION" in risk_note else "")
         state = row['state'] or 'NEW'
         if state == 'WAIT_CAP':
             warning = "Threshold not confirmed with current market data; not security-cleared"
@@ -462,18 +517,15 @@ async def new_discoveries(update: Update, context: ContextTypes.DEFAULT_TYPE):
             warning = "Awaiting market data and screening; NOT cleared"
         name = (row['name'] or 'Unnamed').replace('\n', ' ')[:55]
         symbol = (row['symbol'] or '?').replace('\n', ' ')[:18]
-        entries.append(
+        await update.message.reply_text(
             f"{index}. {name} ({symbol})\n"
             f"Cap: {cap_text} | Seen: {age_minutes}m ago\n"
             f"State: {state} — {warning}\n"
             + (f"Valuation: {risk_note} (last screening)\n" if risk_note else "")
-            + f"Mint: {row['mint']}"
+            + f"Creator: {creator_risk_note(row['creator'], row['mint'])}\n"
+            + f"Mint: {row['mint']}",
+            reply_markup=mint_keyboard(row['mint']),
         )
-    await update.message.reply_text(
-        "EARLY DISCOVERIES — UNVERIFIED\n"
-        "Sorted by time first seen by this bot, NOT verified token age. "
-        "A listing is NOT a buy signal.\n\n" + "\n\n".join(entries)
-    )
 
 
 async def ranking(update: Update, context: ContextTypes.DEFAULT_TYPE, category=None):
@@ -521,7 +573,9 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Provider market cap: {f'US${cap:,.0f}' if cap is not None else 'unknown'}\n"
             f"Valuation: {risk_label(flags)}\n"
             f"{'; '.join(flags) if flags else 'No valuation red flags identified'}\n"
-            f"Launch age NOT verified; security NOT cleared.\nMint: {mint}"
+            f"Creator history unknown (not observed locally).\n"
+            f"Launch age NOT verified; security NOT cleared.\nMint: {mint}",
+            reply_markup=mint_keyboard(mint),
         )
         return
     async with httpx.AsyncClient() as client:
@@ -539,8 +593,10 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Security: {row['security'] if row['security'] is not None else 'unverified'}/10\n"
         f"Potential: {row['potential'] if row['potential'] is not None else 'unverified'}/10\n"
         f"Category: {row['category'] or 'unclassified'}\n"
+        f"Creator: {creator_risk_note(row['creator'], mint)}\n"
         f"{row['reason'] or 'Awaiting checks'}\n"
-        f"Mint: {mint}"
+        f"Mint: {mint}",
+        reply_markup=mint_keyboard(mint),
     )
 
 
