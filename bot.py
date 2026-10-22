@@ -31,8 +31,6 @@ MIN_SCORE = float(os.getenv("MIN_SECURITY_SCORE", "5"))
 POLL = int(os.getenv("POLL_SECONDS", "15"))
 SOL_PRICE_REFRESH_SECONDS = 90
 MARKET_REFRESH_SECONDS = 30
-EARLY_WINDOW_SECONDS = 60
-EARLY_MAX_CAP_USD = 100_000
 # Paid PumpPortal trade streams are intentionally disabled. The AUD amount is
 # a planning ceiling, NOT a provider-side payment limit.
 PAID_STREAM_ENABLED = False
@@ -74,6 +72,17 @@ def init_db():
         for name, dtype in (("launch_cap_sol", "REAL"), ("cap_source", "TEXT"), ("cap_observed_at", "REAL"), ("threshold_alerted_at", "REAL"), ("creator", "TEXT"), ("early_high", "INTEGER DEFAULT 0"), ("early_dex_seen", "INTEGER DEFAULT 0"), ("passed_at", "REAL")):
             if name not in columns:
                 db.execute(f"ALTER TABLE tokens ADD COLUMN {name} {dtype}")
+
+
+def clear_old_early_filter_states():
+    """Restore coins blocked by the retired first-minute filter without erasing data."""
+    with conn() as db:
+        db.execute("UPDATE tokens SET state='WAIT_CAP', updated_at=NULL "
+                   "WHERE state IN ('EARLY_PENDING','EARLY_UNVERIFIED','EARLY_EXCLUDED') "
+                   "AND first_seen>=?", (time.time() - MAX_AGE,))
+        db.execute("UPDATE tokens SET state='EXPIRED' "
+                   "WHERE state IN ('EARLY_PENDING','EARLY_UNVERIFIED','EARLY_EXCLUDED') "
+                   "AND first_seen<?", (time.time() - MAX_AGE,))
 
 
 def creator_launch_count(creator, exclude_mint=None):
@@ -381,17 +390,11 @@ async def worker(application, queue):
                     creator = event.get("traderPublicKey")
                     if isinstance(creator, str) and re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", creator):
                         db.execute("UPDATE tokens SET creator=COALESCE(creator, ?) WHERE mint=?", (creator, mint))
-                # Launch snapshot is an estimate. High snapshot estimates are excluded
-                # conservatively; low estimates do not prove the full minute was safe.
-                if cap_sol is not None and sol_price is not None and time.time() - sol_price_at < 300:
-                    if cap_sol * sol_price > EARLY_MAX_CAP_USD:
-                        with conn() as db:
-                            db.execute("UPDATE tokens SET early_high=1,state='EARLY_EXCLUDED' WHERE mint=?", (mint,))
                 queue.task_done()
             # Avoid excessive provider polling: cap checks are spaced per token.
             with conn() as db:
                 rows = db.execute(
-                    "SELECT * FROM tokens WHERE state IN ('NEW','WAIT_CAP','HOLD','REJECT','EARLY_PENDING') "
+                    "SELECT * FROM tokens WHERE state IN ('NEW','WAIT_CAP','HOLD','REJECT','EARLY_PENDING','EARLY_UNVERIFIED','EARLY_EXCLUDED') "
                     "AND first_seen>? AND (updated_at IS NULL OR updated_at<?) "
                     "ORDER BY COALESCE(updated_at,0) ASC LIMIT 12",
                     (time.time() - MAX_AGE, time.time() - MARKET_REFRESH_SECONDS)).fetchall()
@@ -412,35 +415,11 @@ async def worker(application, queue):
                 elif row["launch_cap_sol"] is not None and sol_price is not None and time.time() - sol_price_at < 300:
                     cap = float(row["launch_cap_sol"]) * sol_price
                     source = "PumpPortal LAUNCH snapshot x SOL/USD (NOT live)"
-                # first_seen is bot observation time, not a verified on-chain
-                # launch timestamp. We cannot guarantee no brief spikes occurred.
-                early_age = time.time() - row["first_seen"]
-                in_first_minute = early_age <= EARLY_WINDOW_SECONDS
-                early_high = bool(row["early_high"])
-                early_dex_seen = bool(row["early_dex_seen"])
-                if in_first_minute and dex_cap is not None:
-                    early_dex_seen = True
-                    if dex_cap > EARLY_MAX_CAP_USD:
-                        early_high = True
-                if early_high:
-                    early_state = "EARLY_EXCLUDED"
-                elif in_first_minute:
-                    early_state = "EARLY_PENDING"
-                elif not early_dex_seen:
-                    # Terminal unknown: do not mistake missing first-minute DEX
-                    # observations for a passed early-cap filter.
-                    early_state = "EARLY_UNVERIFIED"
-                else:
-                    early_state = "WAIT_CAP"
+                # First-minute exclusion gate removed. Continue normal market screening.
                 with conn() as db:
                     db.execute(
-                        "UPDATE tokens SET cap=?,cap_source=?,cap_observed_at=?,updated_at=?,state=?,early_high=?,early_dex_seen=? WHERE mint=?",
-                        (cap, source, time.time() if cap is not None else None, time.time(),
-                         early_state, int(early_high), int(early_dex_seen), mint))
-                # Do not alert before the first-minute observation window closes.
-                # Missing first-minute DEX observations remain unverified.
-                if early_state != "WAIT_CAP":
-                    continue
+                        "UPDATE tokens SET cap=?,cap_source=?,cap_observed_at=?,updated_at=?,state='WAIT_CAP' WHERE mint=?",
+                        (cap, source, time.time() if cap is not None else None, time.time(), mint))
                 valuation_flags = market_warnings(pair, dex_cap) if dex_cap is not None else []
                 creator_note = creator_risk_note(row["creator"], mint)
                 # Notify once per mint when a recent DEX market-cap observation
@@ -478,11 +457,7 @@ async def worker(application, queue):
                         CHAT_ID, f"Candidate {row['name']} ({row['symbol']})\n"
                         f"Security {score}/10 | Potential {potential}/10\n{mint}")
             with conn() as db:
-                # Pending tokens with no DEX sample must not remain pending forever.
-                db.execute("UPDATE tokens SET state='EARLY_UNVERIFIED' "
-                           "WHERE state='EARLY_PENDING' AND first_seen<? AND COALESCE(early_dex_seen,0)=0",
-                           (time.time() - EARLY_WINDOW_SECONDS,))
-                db.execute("UPDATE tokens SET state='EXPIRED' WHERE first_seen<? AND state IN ('NEW','WAIT_CAP','EARLY_PENDING')",
+                db.execute("UPDATE tokens SET state='EXPIRED' WHERE first_seen<? AND state IN ('NEW','WAIT_CAP')",
                            (time.time() - MAX_AGE,))
 
 
@@ -533,16 +508,13 @@ def coin_card(row, pair=None, title=None, extra=None):
     flags = market_warnings(pair, cap) if pair else []
     liquidity = safe_number((pair.get("liquidity") or {}).get("usd")) if pair else None
     state = row["state"] or "UNKNOWN"
-    status = ("🟢" if state == "PASS" else "🔴" if state in ("REJECT", "EARLY_EXCLUDED") else "🟡" if state == "HOLD" else "⚪")
+    status = ("🟢" if state == "PASS" else "🔴" if state == "REJECT" else "🟡" if state == "HOLD" else "⚪")
     score = f"{row['security']}/10" if row["security"] is not None else "Unverified"
     potential = f"{row['potential']}/10" if row["potential"] is not None else "Unverified"
     first = row["first_seen"]
     source = row["cap_source"] or "Unavailable"
     observed = row["cap_observed_at"]
     sampled = age_text(observed) + " ago" if observed else "Unknown"
-    early = ("🔴 Above US$100k in first-minute observation" if row["early_high"] else
-             "🟡 First-minute DEX observation incomplete" if not row["early_dex_seen"] else
-             "🟢 No >US$100k cap seen in sampled first-minute data (not exhaustive)")
     creator = creator_risk_note(row["creator"], mint)
     creator_icon = "🔴" if "HIGH RISK" in creator else "🟡" if "CAUTION" in creator else "⚪"
     reasons = row["reason"] or "Awaiting security screening; LP, sellability and manipulation remain unverified"
@@ -553,7 +525,6 @@ def coin_card(row, pair=None, title=None, extra=None):
         f"⚪ Security checks are not a guarantee of safety",
         f"\n<b>⏱️ LAUNCH & DISCOVERY</b>\nAge since bot observed launch: <b>{age_text(first)}</b>",
         "⚪ Exact on-chain launch age not verified",
-        early,
         f"\n<b>💰 MARKET</b>\nStored cap: {money(row['cap'])}\nSource: {esc(source)}",
         f"Sample age: {sampled}",
         f"Latest DEX cap: {money(cap)}\nDEX liquidity: {money(liquidity)}",
@@ -585,9 +556,8 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = db.execute("SELECT state,COUNT(*) n FROM tokens GROUP BY state").fetchall()
     await update.message.reply_text(
         "States: " + (", ".join(f"{r['state']}={r['n']}" for r in rows) or "none")
-        + "\nEARLY_PENDING: still inside first-minute observation window."
-        + "\nEARLY_UNVERIFIED: no first-minute DEX cap observed; withheld from alerts and /top."
-        + "\nEARLY_EXCLUDED: observed above US$100k early."
+        + "\nFirst-minute market-cap filter: OFF."
+        + "\nSecurity screening remains strict; unverified critical checks stay on HOLD."
         + "\nA$100 total risk budget. Research only.")
 
 
@@ -598,22 +568,19 @@ async def new_discoveries(update: Update, context: ContextTypes.DEFAULT_TYPE):
     now = time.time()
     with conn() as db:
         rows = db.execute(
-            "SELECT * FROM tokens WHERE first_seen >= ? AND state NOT IN ('EXPIRED','EARLY_EXCLUDED','EARLY_PENDING') "
+            "SELECT * FROM tokens WHERE first_seen >= ? AND state != 'EXPIRED' "
             "ORDER BY first_seen DESC LIMIT 10", (now - MAX_AGE,)
         ).fetchall()
     if not rows:
         await update.message.reply_text(
-            "No coins have cleared the first-minute data gate for /new. "
-            "Check /status for EARLY_PENDING, EARLY_UNVERIFIED and EARLY_EXCLUDED counts. "
-            "This does not mean the launch feed is empty."
+            "No recent tokens in the local launch feed yet. Check /status. "
+            "This does not mean Pump.fun has no launches."
         )
         return
     await update.message.reply_text(
         "EARLY DISCOVERIES — UNVERIFIED\n"
-        "Sorted by time first seen by this bot, NOT verified token age. "
-        "Coins observed above US$100k in the first minute are excluded. "
-        "Missing early DEX observations are withheld. First_seen is bot-observed, "
-        "not verified on-chain launch time. A listing is NOT a buy signal. "
+        "Sorted by time first seen by this bot, NOT verified on-chain launch age. "
+        "First-minute cap filter is OFF. A listing is NOT a buy signal. "
         "Tap Copy Mint to copy just the address."
     )
     for index, row in enumerate(rows, 1):
@@ -728,6 +695,7 @@ async def post_shutdown(application):
 
 def main():
     init_db()
+    clear_old_early_filter_states()
     application = Application.builder().token(TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
