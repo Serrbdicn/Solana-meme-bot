@@ -74,17 +74,6 @@ def init_db():
                 db.execute(f"ALTER TABLE tokens ADD COLUMN {name} {dtype}")
 
 
-def clear_old_early_filter_states():
-    """Restore coins blocked by the retired first-minute filter without erasing data."""
-    with conn() as db:
-        db.execute("UPDATE tokens SET state='WAIT_CAP', updated_at=NULL "
-                   "WHERE state IN ('EARLY_PENDING','EARLY_UNVERIFIED','EARLY_EXCLUDED') "
-                   "AND first_seen>=?", (time.time() - MAX_AGE,))
-        db.execute("UPDATE tokens SET state='EXPIRED' "
-                   "WHERE state IN ('EARLY_PENDING','EARLY_UNVERIFIED','EARLY_EXCLUDED') "
-                   "AND first_seen<?", (time.time() - MAX_AGE,))
-
-
 def creator_launch_count(creator, exclude_mint=None):
     """Count launches observed by THIS bot only; not on-chain creator history."""
     if not creator:
@@ -253,6 +242,44 @@ async def largest_accounts(client, mint):
         return None
 
 
+def liquidity_and_sellability_evidence(authority, pair):
+    """Conservative, observable indicators; never assert a successful sell or LP lock."""
+    findings = []
+    critical_unknown = True  # Withdrawal control and executable sell are not verified.
+    if pair is None:
+        findings.append("⚪ Trading stage: no indexed DEX pair; bonding-curve vs migration NOT verified")
+        findings.append("⚪ Liquidity lock: no pool identified; not verifiable")
+    else:
+        dex = str(pair.get("dexId") or "unknown")[:48]
+        address = str(pair.get("pairAddress") or "unknown")[:60]
+        findings.append(f"🟡 DEX pool observed: {dex} | pool: {address} (migration NOT proven)")
+        findings.append("⚪ Liquidity lock/withdrawal rights: UNVERIFIED; pool-specific on-chain audit required")
+        liquidity = safe_number((pair.get("liquidity") or {}).get("usd"))
+        if liquidity is None:
+            findings.append("⚪ Reported liquidity unavailable")
+        elif liquidity == 0:
+            findings.append("🔴 Provider reports zero liquidity; trading may be impossible")
+        elif liquidity < 3000:
+            findings.append(f"🟡 Thin reported liquidity: US${liquidity:,.0f}; price impact risk")
+        else:
+            findings.append(f"🟡 Provider reports US${liquidity:,.0f} liquidity; NOT evidence of lock")
+    if authority is None:
+        findings.append("⚪ Sell restrictions: mint account unavailable; cannot inspect authorities/extensions")
+    else:
+        if not authority["freeze_disabled"]:
+            findings.append("🔴 Freeze authority ACTIVE: token accounts may be frozen")
+        else:
+            findings.append("🟢 Freeze authority disabled (does NOT prove sellability)")
+        extensions = authority["extensions"]
+        if extensions:
+            names = [str(e.get("extension") or e.get("type") or "unknown")[:40] if isinstance(e, dict) else str(e)[:40] for e in extensions]
+            findings.append("🟡 Token extensions present: " + ", ".join(names[:12]) + "; transfer rules require audit")
+        else:
+            findings.append("🟢 No extensions reported by parsed mint (NOT a successful sell test)")
+    findings.append("⚪ Actual sell execution: NOT TESTED; no simulation or trade performed")
+    return findings, critical_unknown
+
+
 async def inspect(client, mint, record, headlines):
     authority, pair, concentration = await asyncio.gather(
         check_authorities(client, mint), market(client, mint), largest_accounts(client, mint)
@@ -302,9 +329,10 @@ async def inspect(client, mint, record, headlines):
     elif creator_note.startswith("CAUTION"):
         score -= 1
     # Holder concentration counts token accounts, not beneficial owners or linked wallets.
-    # Do not assert liquidity burn, sellability, holder clusters, or candle safety.
-    critical_unknown = True
-    flags.append("LP security, sellability and manipulation checks NOT implemented")
+    evidence, unresolved = liquidity_and_sellability_evidence(authority, pair)
+    flags.extend(evidence)
+    critical_unknown = critical_unknown or unresolved
+    flags.append("⚪ Wash trading and linked-wallet manipulation NOT verified")
     score = max(0.0, min(10.0, score))
     category, potential, why = category_and_potential(record["name"], record["symbol"], headlines)
     state = "HOLD" if critical_unknown else ("PASS" if score >= MIN_SCORE else "REJECT")
@@ -415,10 +443,11 @@ async def worker(application, queue):
                 elif row["launch_cap_sol"] is not None and sol_price is not None and time.time() - sol_price_at < 300:
                     cap = float(row["launch_cap_sol"]) * sol_price
                     source = "PumpPortal LAUNCH snapshot x SOL/USD (NOT live)"
-                # First-minute exclusion gate removed. Continue normal market screening.
+                # No first-minute cap gate: provider observations determine alerts.
+                # Previous EARLY_* rows are eligible for reprocessing.
                 with conn() as db:
                     db.execute(
-                        "UPDATE tokens SET cap=?,cap_source=?,cap_observed_at=?,updated_at=?,state='WAIT_CAP' WHERE mint=?",
+                        "UPDATE tokens SET cap=?,cap_source=?,cap_observed_at=?,updated_at=?,state='WAIT_CAP',early_high=0,early_dex_seen=0 WHERE mint=?",
                         (cap, source, time.time() if cap is not None else None, time.time(), mint))
                 valuation_flags = market_warnings(pair, dex_cap) if dex_cap is not None else []
                 creator_note = creator_risk_note(row["creator"], mint)
@@ -459,6 +488,7 @@ async def worker(application, queue):
             with conn() as db:
                 db.execute("UPDATE tokens SET state='EXPIRED' WHERE first_seen<? AND state IN ('NEW','WAIT_CAP')",
                            (time.time() - MAX_AGE,))
+
 
 
 
@@ -508,7 +538,7 @@ def coin_card(row, pair=None, title=None, extra=None):
     flags = market_warnings(pair, cap) if pair else []
     liquidity = safe_number((pair.get("liquidity") or {}).get("usd")) if pair else None
     state = row["state"] or "UNKNOWN"
-    status = ("🟢" if state == "PASS" else "🔴" if state == "REJECT" else "🟡" if state == "HOLD" else "⚪")
+    status = ("🟢" if state == "PASS" else "🔴" if state in ("REJECT", "EARLY_EXCLUDED") else "🟡" if state == "HOLD" else "⚪")
     score = f"{row['security']}/10" if row["security"] is not None else "Unverified"
     potential = f"{row['potential']}/10" if row["potential"] is not None else "Unverified"
     first = row["first_seen"]
@@ -525,6 +555,7 @@ def coin_card(row, pair=None, title=None, extra=None):
         f"⚪ Security checks are not a guarantee of safety",
         f"\n<b>⏱️ LAUNCH & DISCOVERY</b>\nAge since bot observed launch: <b>{age_text(first)}</b>",
         "⚪ Exact on-chain launch age not verified",
+        "⚪ No first-minute market-cap exclusion; launch age remains approximate",
         f"\n<b>💰 MARKET</b>\nStored cap: {money(row['cap'])}\nSource: {esc(source)}",
         f"Sample age: {sampled}",
         f"Latest DEX cap: {money(cap)}\nDEX liquidity: {money(liquidity)}",
@@ -556,8 +587,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows = db.execute("SELECT state,COUNT(*) n FROM tokens GROUP BY state").fetchall()
     await update.message.reply_text(
         "States: " + (", ".join(f"{r['state']}={r['n']}" for r in rows) or "none")
-        + "\nFirst-minute market-cap filter: OFF."
-        + "\nSecurity screening remains strict; unverified critical checks stay on HOLD."
+        + "\nFirst-minute US$100k filter: OFF. Historical EARLY_* records may remain until processed."
         + "\nA$100 total risk budget. Research only.")
 
 
@@ -579,8 +609,9 @@ async def new_discoveries(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await update.message.reply_text(
         "EARLY DISCOVERIES — UNVERIFIED\n"
-        "Sorted by time first seen by this bot, NOT verified on-chain launch age. "
-        "First-minute cap filter is OFF. A listing is NOT a buy signal. "
+        "Sorted by time first seen by this bot, NOT verified token age. "
+        "No first-minute cap exclusion. First_seen is bot-observed, "
+        "not verified on-chain launch time. A listing is NOT a buy signal. "
         "Tap Copy Mint to copy just the address."
     )
     for index, row in enumerate(rows, 1):
@@ -695,7 +726,6 @@ async def post_shutdown(application):
 
 def main():
     init_db()
-    clear_old_early_filter_states()
     application = Application.builder().token(TOKEN).post_init(post_init).post_shutdown(post_shutdown).build()
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
