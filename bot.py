@@ -395,9 +395,15 @@ async def worker(application, queue):
                     "AND first_seen>? AND (updated_at IS NULL OR updated_at<?) "
                     "ORDER BY COALESCE(updated_at,0) ASC LIMIT 12",
                     (time.time() - MAX_AGE, time.time() - MARKET_REFRESH_SECONDS)).fetchall()
-            for row in rows:
+            # Poll DEX markets concurrently: sequential 10-second timeouts could
+            # consume the entire first-minute window for later launches.
+            semaphore = asyncio.Semaphore(8)
+            async def fetch_pair(row):
+                async with semaphore:
+                    return await market(client, row["mint"])
+            pairs = await asyncio.gather(*(fetch_pair(row) for row in rows))
+            for row, pair in zip(rows, pairs):
                 mint = row["mint"]
-                pair = await market(client, mint)
                 dex_cap = provider_cap(pair)
                 cap, source = None, None
                 # Prefer a recently fetched DEX provider observation over the launch snapshot.
@@ -418,8 +424,12 @@ async def worker(application, queue):
                         early_high = True
                 if early_high:
                     early_state = "EARLY_EXCLUDED"
-                elif in_first_minute or not early_dex_seen:
+                elif in_first_minute:
                     early_state = "EARLY_PENDING"
+                elif not early_dex_seen:
+                    # Terminal unknown: do not mistake missing first-minute DEX
+                    # observations for a passed early-cap filter.
+                    early_state = "EARLY_UNVERIFIED"
                 else:
                     early_state = "WAIT_CAP"
                 with conn() as db:
@@ -468,6 +478,10 @@ async def worker(application, queue):
                         CHAT_ID, f"Candidate {row['name']} ({row['symbol']})\n"
                         f"Security {score}/10 | Potential {potential}/10\n{mint}")
             with conn() as db:
+                # Pending tokens with no DEX sample must not remain pending forever.
+                db.execute("UPDATE tokens SET state='EARLY_UNVERIFIED' "
+                           "WHERE state='EARLY_PENDING' AND first_seen<? AND COALESCE(early_dex_seen,0)=0",
+                           (time.time() - EARLY_WINDOW_SECONDS,))
                 db.execute("UPDATE tokens SET state='EXPIRED' WHERE first_seen<? AND state IN ('NEW','WAIT_CAP','EARLY_PENDING')",
                            (time.time() - MAX_AGE,))
 
@@ -569,7 +583,12 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update): return
     with conn() as db:
         rows = db.execute("SELECT state,COUNT(*) n FROM tokens GROUP BY state").fetchall()
-    await update.message.reply_text("States: " + (", ".join(f"{r['state']}={r['n']}" for r in rows) or "none") + "\nA$100 total risk budget. Research only.")
+    await update.message.reply_text(
+        "States: " + (", ".join(f"{r['state']}={r['n']}" for r in rows) or "none")
+        + "\nEARLY_PENDING: still inside first-minute observation window."
+        + "\nEARLY_UNVERIFIED: no first-minute DEX cap observed; withheld from alerts and /top."
+        + "\nEARLY_EXCLUDED: observed above US$100k early."
+        + "\nA$100 total risk budget. Research only.")
 
 
 async def new_discoveries(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -584,8 +603,9 @@ async def new_discoveries(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ).fetchall()
     if not rows:
         await update.message.reply_text(
-            "No recent tokens in the local launch feed yet. Check /status. "
-            "This is not evidence that Pump.fun has no launches."
+            "No coins have cleared the first-minute data gate for /new. "
+            "Check /status for EARLY_PENDING, EARLY_UNVERIFIED and EARLY_EXCLUDED counts. "
+            "This does not mean the launch feed is empty."
         )
         return
     await update.message.reply_text(
