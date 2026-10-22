@@ -3,6 +3,7 @@ import asyncio
 import contextlib
 import datetime as dt
 import json
+import html
 import logging
 import math
 import os
@@ -64,13 +65,13 @@ def init_db():
           category TEXT, state TEXT, reason TEXT, updated_at REAL,
           launch_cap_sol REAL, cap_source TEXT, cap_observed_at REAL,
           threshold_alerted_at REAL, creator TEXT,
-          early_high INTEGER DEFAULT 0, early_dex_seen INTEGER DEFAULT 0);
+          early_high INTEGER DEFAULT 0, early_dex_seen INTEGER DEFAULT 0, passed_at REAL);
         CREATE TABLE IF NOT EXISTS news (
           url TEXT PRIMARY KEY, title TEXT, published REAL, fetched REAL);
         CREATE TABLE IF NOT EXISTS watchlist (handle TEXT PRIMARY KEY);
         """)
         columns = {r[1] for r in db.execute("PRAGMA table_info(tokens)")}
-        for name, dtype in (("launch_cap_sol", "REAL"), ("cap_source", "TEXT"), ("cap_observed_at", "REAL"), ("threshold_alerted_at", "REAL"), ("creator", "TEXT"), ("early_high", "INTEGER DEFAULT 0"), ("early_dex_seen", "INTEGER DEFAULT 0")):
+        for name, dtype in (("launch_cap_sol", "REAL"), ("cap_source", "TEXT"), ("cap_observed_at", "REAL"), ("threshold_alerted_at", "REAL"), ("creator", "TEXT"), ("early_high", "INTEGER DEFAULT 0"), ("early_dex_seen", "INTEGER DEFAULT 0"), ("passed_at", "REAL")):
             if name not in columns:
                 db.execute(f"ALTER TABLE tokens ADD COLUMN {name} {dtype}")
 
@@ -460,8 +461,8 @@ async def worker(application, queue):
                 score, potential, category, state, reason = await inspect(client, mint, row, headlines)
                 with conn() as db:
                     db.execute(
-                        "UPDATE tokens SET security=?,potential=?,category=?,state=?,reason=?,updated_at=? WHERE mint=?",
-                        (score, potential, category, state, reason, time.time(), mint))
+                        "UPDATE tokens SET security=?,potential=?,category=?,state=?,reason=?,updated_at=?,passed_at=CASE WHEN ?='PASS' THEN COALESCE(passed_at, ?) ELSE passed_at END WHERE mint=?",
+                        (score, potential, category, state, reason, time.time(), state, time.time(), mint))
                 if state == "PASS":
                     await application.bot.send_message(
                         CHAT_ID, f"Candidate {row['name']} ({row['symbol']})\n"
@@ -486,13 +487,82 @@ def mint_keyboard(mint):
     return InlineKeyboardMarkup([[button]])
 
 
+def age_text(seen):
+    if not seen:
+        return "Unknown"
+    seconds = max(0, int(time.time() - seen))
+    if seconds < 3600:
+        return f"{seconds // 60}m {seconds % 60}s"
+    if seconds < 86400:
+        return f"{seconds // 3600}h {(seconds % 3600) // 60}m"
+    return f"{seconds // 86400}d {(seconds % 86400) // 3600}h"
+
+
+def money(value):
+    return f"US${value:,.0f}" if value is not None else "Unknown"
+
+
+def esc(value):
+    return html.escape(str(value or "Unknown"))
+
+
+def risk_lines(flags):
+    if not flags:
+        return "⚪ No valuation flags identified; other security checks may remain unverified"
+    return "\n".join(("🔴 " if "EXTREME" in f or "Zero reported" in f else "🟡 ") + esc(f) for f in flags)
+
+
+def coin_card(row, pair=None, title=None, extra=None):
+    """All stored screening details remain visible; HTML is escaped for safety."""
+    mint = row["mint"]
+    cap = provider_cap(pair) if pair else None
+    flags = market_warnings(pair, cap) if pair else []
+    liquidity = safe_number((pair.get("liquidity") or {}).get("usd")) if pair else None
+    state = row["state"] or "UNKNOWN"
+    status = ("🟢" if state == "PASS" else "🔴" if state in ("REJECT", "EARLY_EXCLUDED") else "🟡" if state == "HOLD" else "⚪")
+    score = f"{row['security']}/10" if row["security"] is not None else "Unverified"
+    potential = f"{row['potential']}/10" if row["potential"] is not None else "Unverified"
+    first = row["first_seen"]
+    source = row["cap_source"] or "Unavailable"
+    observed = row["cap_observed_at"]
+    sampled = age_text(observed) + " ago" if observed else "Unknown"
+    early = ("🔴 Above US$100k in first-minute observation" if row["early_high"] else
+             "🟡 First-minute DEX observation incomplete" if not row["early_dex_seen"] else
+             "🟢 No >US$100k cap seen in sampled first-minute data (not exhaustive)")
+    creator = creator_risk_note(row["creator"], mint)
+    creator_icon = "🔴" if "HIGH RISK" in creator else "🟡" if "CAUTION" in creator else "⚪"
+    reasons = row["reason"] or "Awaiting security screening; LP, sellability and manipulation remain unverified"
+    heading = title or f"🪙 {row['name'] or 'Unnamed'} ({row['symbol'] or '?'})"
+    parts = [
+        f"<b>{esc(heading)}</b>",
+        f"\n<b>🛡️ SECURITY</b>\n{status} Status: <b>{esc(state)}</b> | Score: {esc(score)}",
+        f"⚪ Security checks are not a guarantee of safety",
+        f"\n<b>⏱️ LAUNCH & DISCOVERY</b>\nAge since bot observed launch: <b>{age_text(first)}</b>",
+        "⚪ Exact on-chain launch age not verified",
+        early,
+        f"\n<b>💰 MARKET</b>\nStored cap: {money(row['cap'])}\nSource: {esc(source)}",
+        f"Sample age: {sampled}",
+        f"Latest DEX cap: {money(cap)}\nDEX liquidity: {money(liquidity)}",
+        f"\n<b>🚨 VALUATION WARNINGS</b>\n{risk_lines(flags)}",
+        f"\n<b>👤 CREATOR</b>\n{creator_icon} {esc(creator)}",
+        f"\n<b>🔍 SECURITY DETAILS</b>\n{esc(reasons)}",
+        f"\n<b>📊 NARRATIVE</b>\nCategory: {esc(row['category'] or 'Unclassified')} | Potential: {esc(potential)}",
+        f"\n<b>📋 MINT</b>\n<code>{esc(mint)}</code>",
+    ]
+    if row["passed_at"]:
+        parts.insert(2, f"First PASS recorded: {age_text(row['passed_at'])} ago")
+    if extra:
+        parts.insert(1, esc(extra))
+    return "\n".join(parts)[:4000]
+
+
 def authorized(update):
     return update.effective_chat is not None and update.effective_chat.id == CHAT_ID
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if authorized(update):
-        await update.message.reply_text("Pump.fun research bot online. /new (early discoveries; launch cap estimates are NOT live or verified) /status /top /news /viral /phrases /original /culture /remix /check <mint> /accounts /addaccount <handle> /removeaccount <handle>\n\nHOLD means critical security checks are unverified. No trading.")
+        await update.message.reply_text("Pump.fun research bot online. /new (early discoveries; launch cap estimates are NOT live or verified) /status /top /topday /news /viral /phrases /original /culture /remix /check <mint> /accounts /addaccount <handle> /removeaccount <handle>\n\nHOLD means critical security checks are unverified. No trading.")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -527,55 +597,44 @@ async def new_discoveries(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Tap Copy Mint to copy just the address."
     )
     for index, row in enumerate(rows, 1):
-        age_minutes = max(0, int((now - row['first_seen']) / 60))
-        cap = row['cap']
-        cap_text = f"US${cap:,.0f}" if cap is not None else "unknown"
-        source = row["cap_source"] or "No verified market data"
-        observed = row["cap_observed_at"]
-        cap_age = f"; sampled {int((now-observed)/60)}m ago" if observed else ""
-        cap_text += f" [{source}{cap_age}]"
-        # Stored risk notes are derived from the latest screening, not a fresh quote.
-        risk_note = (row["reason"] or "")
-        risk_note = "HIGH RISK FLAG" if "EXTREME" in risk_note or "HIGH RISK FLAG" in risk_note else ("CAUTION" if "valuation" in risk_note.lower() or "ratio" in risk_note.lower() or "CAUTION" in risk_note else "")
-        state = row['state'] or 'NEW'
-        if state == 'WAIT_CAP':
-            warning = "Threshold not confirmed with current market data; not security-cleared"
-        elif state == 'HOLD':
-            warning = "Security verification incomplete; NOT cleared"
-        elif state == 'REJECT':
-            warning = "Failed preliminary screening; NOT cleared"
-        elif state == 'PASS':
-            warning = "Passed configured checks (review evidence independently)"
-        else:
-            warning = "Awaiting market data and screening; NOT cleared"
-        name = (row['name'] or 'Unnamed').replace('\n', ' ')[:55]
-        symbol = (row['symbol'] or '?').replace('\n', ' ')[:18]
         await update.message.reply_text(
-            f"{index}. {name} ({symbol})\n"
-            f"Cap: {cap_text} | Seen: {age_minutes}m ago\n"
-            f"State: {state} — {warning}\n"
-            + (f"Valuation: {risk_note} (last screening)\n" if risk_note else "")
-            + f"Creator: {creator_risk_note(row['creator'], row['mint'])}\n"
-            + f"Mint: {row['mint']}",
-            reply_markup=mint_keyboard(row['mint']),
-        )
+            coin_card(row, title=f"🪙 #{index} {row['name'] or 'Unnamed'} ({row['symbol'] or '?'})"),
+            parse_mode="HTML", reply_markup=mint_keyboard(row['mint']))
 
 
-async def ranking(update: Update, context: ContextTypes.DEFAULT_TYPE, category=None):
-    if not authorized(update): return
+async def ranking(update: Update, context: ContextTypes.DEFAULT_TYPE, category=None, today=False):
+    if not authorized(update):
+        return
     with conn() as db:
-        if category:
+        if today:
+            # Historical first PASS timestamp, retained even if the state later changes.
+            rows = db.execute(
+                "SELECT * FROM tokens WHERE passed_at>=? ORDER BY passed_at DESC LIMIT 100",
+                (time.time() - 86400,)).fetchall()
+        elif category:
             rows = db.execute("SELECT * FROM tokens WHERE state='PASS' AND category=? ORDER BY potential DESC,security DESC LIMIT 10", (category,)).fetchall()
         else:
             rows = db.execute("SELECT * FROM tokens WHERE state='PASS' ORDER BY potential DESC,security DESC LIMIT 10").fetchall()
     if not rows:
-        await update.message.reply_text("No fully verified qualifying coins yet. Unverified security checks are held back, not silently passed.")
+        await update.message.reply_text(
+            "No coins recorded as PASS in the last 24 hours." if today else
+            "No fully verified qualifying coins yet. Unverified critical checks remain on HOLD.")
         return
-    await update.message.reply_text("\n\n".join(f"{i}. {r['name']} (${r['symbol']})\nSecurity {r['security']}/10 · Potential {r['potential']}/10\n{r['mint']}" for i,r in enumerate(rows,1)))
+    await update.message.reply_text(
+        "📅 TOPDAY — first passed within 24h; historical PASS does NOT imply still safe." if today else
+        "🏆 TOP — current PASS records (no fixed age window).")
+    for row in rows:
+        await update.message.reply_text(
+            coin_card(row), parse_mode="HTML", reply_markup=mint_keyboard(row['mint']))
+
+
+async def topday(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await ranking(update, context, today=True)
 
 
 async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not authorized(update): return
+    if not authorized(update):
+        return
     if not context.args:
         await update.message.reply_text("Usage: /check <Solana mint address>")
         return
@@ -585,52 +644,28 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     with conn() as db:
         row = db.execute("SELECT * FROM tokens WHERE mint=?", (mint,)).fetchone()
+    async with httpx.AsyncClient() as client:
+        pair = await market(client, mint)
     if not row:
-        # A Render restart can remove the ephemeral SQLite database. Never claim
-        # that an external lookup proves the token was observed at launch.
-        async with httpx.AsyncClient() as client:
-            pair = await market(client, mint)
         if not pair:
-            await update.message.reply_text(
-                "Not in this bot's local launch history, and no matching Solana DEX pair was found. "
-                "Launch age and security cannot be verified."
-            )
+            await update.message.reply_text("No local launch record and no matching Solana DEX pair. Launch age and security unverified.")
             return
         cap = provider_cap(pair)
         flags = market_warnings(pair, cap)
         name = (pair.get("baseToken") or {}).get("name") or "Unknown"
         symbol = (pair.get("baseToken") or {}).get("symbol") or "?"
-        await update.message.reply_text(
-            f"EXTERNAL LOOKUP ONLY (not in local launch history)\n"
-            f"{name} ({symbol})\n"
-            f"Provider market cap: {f'US${cap:,.0f}' if cap is not None else 'unknown'}\n"
-            f"Valuation: {risk_label(flags)}\n"
-            f"{'; '.join(flags) if flags else 'No valuation red flags identified'}\n"
-            f"Creator history unknown (not observed locally).\n"
-            f"Launch age NOT verified; security NOT cleared.\nMint: {mint}",
-            reply_markup=mint_keyboard(mint),
-        )
+        msg = (f"<b>🪙 {esc(name)} ({esc(symbol)})</b>\n"
+               "⚪ <b>EXTERNAL LOOKUP ONLY — security NOT cleared</b>\n"
+               "⏱️ Launch age: Unknown (not observed locally)\n"
+               f"💰 Provider cap: {money(cap)}\n"
+               f"💧 DEX liquidity: {money(safe_number((pair.get('liquidity') or {}).get('usd')))}\n"
+               f"🚨 <b>Valuation</b>\n{risk_lines(flags)}\n"
+               "⚪ Creator history, mint/freeze authorities, LP security, holder concentration, "
+               "sellability and manipulation NOT checked in this external lookup.\n"
+               f"📋 Mint: <code>{esc(mint)}</code>")
+        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=mint_keyboard(mint))
         return
-    async with httpx.AsyncClient() as client:
-        pair = await market(client, mint)
-    live_cap = provider_cap(pair)
-    flags = market_warnings(pair, live_cap)
-    stored_cap = f"US${row['cap']:,.0f}" if row['cap'] is not None else "unknown"
-    await update.message.reply_text(
-        f"{row['name']} ({row['symbol']})\n"
-        f"State: {row['state']}\n"
-        f"Stored cap: {stored_cap} ({row['cap_source'] or 'unavailable'})\n"
-        f"Latest DEX cap: {f'US${live_cap:,.0f}' if live_cap is not None else 'unavailable'}\n"
-        f"Valuation: {risk_label(flags)}\n"
-        f"{'; '.join(flags) if flags else 'No valuation red flags identified'}\n"
-        f"Security: {row['security'] if row['security'] is not None else 'unverified'}/10\n"
-        f"Potential: {row['potential'] if row['potential'] is not None else 'unverified'}/10\n"
-        f"Category: {row['category'] or 'unclassified'}\n"
-        f"Creator: {creator_risk_note(row['creator'], mint)}\n"
-        f"{row['reason'] or 'Awaiting checks'}\n"
-        f"Mint: {mint}",
-        reply_markup=mint_keyboard(mint),
-    )
+    await update.message.reply_text(coin_card(row, pair), parse_mode="HTML", reply_markup=mint_keyboard(mint))
 
 
 async def accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -677,6 +712,7 @@ def main():
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("status", status))
     application.add_handler(CommandHandler("top", ranking))
+    application.add_handler(CommandHandler("topday", topday))
     application.add_handler(CommandHandler("new", new_discoveries))
     for key in CATEGORIES:
         async def handler(update, context, category=key):
