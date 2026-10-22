@@ -353,66 +353,91 @@ def liquidity_and_sellability_evidence(authority, pair):
     return findings, critical_unknown
 
 
+def assess_checks(authority, pair, concentration, rug, creator, mint):
+    """Score only observed evidence. A missing check is not a positive result."""
+    checks = []
+    warnings = []
+    def add(name, value, deduction=0, note=None):
+        checks.append({"name": name, "value": value, "deduction": deduction})
+        if note:
+            warnings.append(note)
+
+    if authority is not None:
+        add("Mint authority", "disabled" if authority["mint_disabled"] else "ACTIVE", 0 if authority["mint_disabled"] else 4,
+            None if authority["mint_disabled"] else "Mint authority active")
+        add("Freeze authority", "disabled" if authority["freeze_disabled"] else "ACTIVE", 0 if authority["freeze_disabled"] else 4,
+            None if authority["freeze_disabled"] else "Freeze authority active")
+        if authority.get("extensions"):
+            warnings.append("Token extensions require separate review")
+    if concentration is not None:
+        deduction = 3 if concentration >= .5 else 1.5 if concentration >= .3 else 0
+        add("Top 5 accounts", f"{concentration:.0%} (pools included)", deduction,
+            "High concentration in top 5 token accounts" if deduction else None)
+    if pair is not None:
+        liq = safe_number((pair.get("liquidity") or {}).get("usd"))
+        if liq is not None:
+            deduction = 3 if liq == 0 else 2 if liq < 3000 else 0
+            add("DEX liquidity", money(liq), deduction, "Low or zero DEX liquidity" if deduction else None)
+        cap = provider_cap(pair)
+        if cap is not None and liq is not None and liq > 0:
+            ratio = cap / liq
+            deduction = 3 if ratio >= 1000 else 1 if ratio >= 100 else 0
+            add("Cap / liquidity", f"{ratio:.0f}x", deduction,
+                "High market cap relative to liquidity" if deduction else None)
+    summary = rug.get("summary") or {}
+    full = rug.get("full") or {}
+    data = summary or full
+    lock = data.get("lpLockedPct")
+    if lock is None:
+        lock = full.get("lpLockedPct")
+    if isinstance(lock, (int, float)) and not isinstance(lock, bool) and math.isfinite(lock) and 0 <= lock <= 100:
+        deduction = 3 if lock < 50 else 1 if lock < 90 else 0
+        add("LP locked (Rugcheck)", f"{lock:g}% reported", deduction,
+            "Low provider-reported LP lock" if deduction else None)
+    risks = data.get("risks")
+    if not isinstance(risks, list):
+        risks = full.get("risks")
+    if isinstance(risks, list):
+        severe = [r for r in risks if isinstance(r, dict) and str(r.get("level", "")).lower() in ("danger", "error", "critical")]
+        add("Rugcheck risk report", f"{len(risks)} listed ({len(severe)} severe)", 3 if severe else 0,
+            "Rugcheck reported severe risk(s)" if severe else None)
+    count = creator_launch_count(creator, mint)
+    if count is not None:
+        deduction = 3 if count >= 5 else 1 if count >= 2 else 0
+        add("Local creator launches", str(count), deduction,
+            "Creator has multiple launches observed locally" if deduction else None)
+    score = max(0., 10. - sum(x["deduction"] for x in checks)) if checks else None
+    # No successful sell test or independent pool-withdrawal verification exists.
+    return {"score": score, "completed": len(checks), "total": 8,
+            "checks": checks, "warnings": warnings,
+            "unverified": ["Actual sell execution", "Pool withdrawal rights", "Linked-wallet ownership"],
+            "label": "PROVISIONAL — NOT SAFETY VERIFIED"}
+
+
+def encode_assessment(assessment):
+    return "SAFETY_JSON:" + json.dumps(assessment, ensure_ascii=False, separators=(",", ":"))
+
+
+def decode_assessment(reason):
+    if not reason or not reason.startswith("SAFETY_JSON:"):
+        return None
+    try:
+        return json.loads(reason[len("SAFETY_JSON:"):])
+    except (ValueError, TypeError):
+        return None
+
+
 async def inspect(client, mint, record, headlines):
     authority, pair, concentration, rug = await asyncio.gather(
-        check_authorities(client, mint), market(client, mint), largest_accounts(client, mint),
-        rugcheck_report(client, mint)
-    )
-    flags = []
-    score = 10.0
-    critical_unknown = False
-    if authority is None:
-        critical_unknown = True
-        flags.append("Mint authorities unknown")
-    else:
-        if not authority["mint_disabled"]:
-            flags.append("Mint authority active")
-            score -= 4
-        if not authority["freeze_disabled"]:
-            flags.append("Freeze authority active")
-            score -= 4
-        if authority["extensions"]:
-            critical_unknown = True
-            flags.append("Token extensions require manual inspection")
-    if concentration is None:
-        critical_unknown = True
-        flags.append("Holder distribution unknown")
-    elif concentration >= .5:
-        score -= 3
-        flags.append(f"Top 5 token accounts control {concentration:.0%} (includes pools)")
-    elif concentration >= .3:
-        score -= 1.5
-        flags.append(f"Top 5 token accounts control {concentration:.0%} (includes pools)")
-    if pair is None:
-        flags.append("No indexed DEX market yet")
-    else:
-        liquidity = safe_number((pair.get("liquidity") or {}).get("usd"))
-        if liquidity is not None and liquidity < 3000:
-            score -= 2
-            flags.append("Low reported DEX liquidity")
-        valuation_flags = market_warnings(pair, provider_cap(pair))
-        flags.extend(valuation_flags)
-        if any("EXTREME" in f or "Zero reported" in f for f in valuation_flags):
-            score -= 3
-        elif valuation_flags:
-            score -= 1
-    creator_note = creator_risk_note(record["creator"] if "creator" in record.keys() else None, mint)
-    flags.append(creator_note)
-    if creator_note.startswith("HIGH RISK"):
-        score -= 3
-    elif creator_note.startswith("CAUTION"):
-        score -= 1
-    # Holder concentration counts token accounts, not beneficial owners or linked wallets.
-    evidence, unresolved = liquidity_and_sellability_evidence(authority, pair)
-    flags.extend(evidence)
-    rug_lines, _ = rugcheck_evidence(rug)
-    flags.extend(rug_lines)
-    critical_unknown = critical_unknown or unresolved
-    flags.append("⚪ Wash trading and linked-wallet manipulation NOT verified")
-    score = max(0.0, min(10.0, score))
+        check_authorities(client, mint), market(client, mint),
+        largest_accounts(client, mint), rugcheck_report(client, mint))
+    assessment = assess_checks(authority, pair, concentration, rug,
+                               record["creator"] if "creator" in record.keys() else None, mint)
     category, potential, why = category_and_potential(record["name"], record["symbol"], headlines)
-    state = "HOLD" if critical_unknown else ("PASS" if score >= MIN_SCORE else "REJECT")
-    return score, potential, category, state, "; ".join(flags + [why])
+    assessment["narrative"] = why
+    # PRELIMINARY is a research ranking, never a verified PASS.
+    state = "PRELIMINARY" if assessment["score"] is not None and assessment["score"] >= MIN_SCORE else "REJECT" if assessment["score"] is not None else "HOLD"
+    return assessment["score"], potential, category, state, encode_assessment(assessment)
 
 
 async def fetch_headlines(client):
@@ -538,14 +563,11 @@ async def worker(application, queue):
                     if updated:
                         await application.bot.send_message(
                             CHAT_ID,
-                            f"MARKET-CAP WATCH (UNVERIFIED)\n"
-                            f"{row['name']} ({row['symbol']})\n"
-                            f"Provider-reported cap: US${cap:,.0f} (recent DEX poll)\n"
-                            f"Valuation risk: {risk_label(valuation_flags)}\n"
-                            f"Creator: {creator_note}\n"
-                            + ("; ".join(valuation_flags) + "\n" if valuation_flags else "")
-                            + f"Crossing time and launch age NOT confirmed. Security NOT cleared.\n"
-                            f"Mint: {mint}",
+                             f"🪙 <b>{esc(row['name'])} ({esc(row['symbol'])})</b>\n"
+                             f"💰 Cap: {money(cap)}\n"
+                             f"🛡️ Screening pending — not safety verified\n"
+                             f"📋 <code>{esc(mint)}</code>",
+                             parse_mode="HTML",
                             reply_markup=mint_keyboard(mint))
                 # Only a current DEX observation can trigger further screening here.
                 # Launch snapshots are displayed for research but never treated as
@@ -607,45 +629,45 @@ def risk_lines(flags):
     return "\n".join(("🔴 " if "EXTREME" in f or "Zero reported" in f else "🟡 ") + esc(f) for f in flags)
 
 
-def coin_card(row, pair=None, title=None, extra=None):
-    """All stored screening details remain visible; HTML is escaped for safety."""
+def coin_card(row, pair=None, title=None, extra=None, detailed=False):
+    """Compact Telegram card; detailed checks only on explicit request."""
     mint = row["mint"]
+    assessment = decode_assessment(row["reason"])
+    score = row["security"]
+    coverage = f"{assessment['completed']}/{assessment['total']}" if assessment else "Not recorded"
     cap = provider_cap(pair) if pair else None
-    flags = market_warnings(pair, cap) if pair else []
-    liquidity = safe_number((pair.get("liquidity") or {}).get("usd")) if pair else None
-    state = row["state"] or "UNKNOWN"
-    status = ("🟢" if state == "PASS" else "🔴" if state in ("REJECT", "EARLY_EXCLUDED") else "🟡" if state == "HOLD" else "⚪")
-    score = f"{row['security']}/10" if row["security"] is not None else "Unverified"
-    potential = f"{row['potential']}/10" if row["potential"] is not None else "Unverified"
-    first = row["first_seen"]
-    source = row["cap_source"] or "Unavailable"
-    observed = row["cap_observed_at"]
-    sampled = age_text(observed) + " ago" if observed else "Unknown"
-    creator = creator_risk_note(row["creator"], mint)
-    creator_icon = "🔴" if "HIGH RISK" in creator else "🟡" if "CAUTION" in creator else "⚪"
-    reasons = row["reason"] or "Awaiting security screening; LP, sellability and manipulation remain unverified"
+    if cap is None:
+        cap = row["cap"]
+    liq = safe_number((pair.get("liquidity") or {}).get("usd")) if pair else None
+    lock = next((c["value"] for c in assessment["checks"] if c["name"] == "LP locked (Rugcheck)"), None) if assessment else None
+    holders = next((c["value"] for c in assessment["checks"] if c["name"] == "Top 5 accounts"), None) if assessment else None
+    status = row["state"] or "NEW"
     heading = title or f"🪙 {row['name'] or 'Unnamed'} ({row['symbol'] or '?'})"
-    parts = [
-        f"<b>{esc(heading)}</b>",
-        f"\n<b>🛡️ SECURITY</b>\n{status} Status: <b>{esc(state)}</b> | Score: {esc(score)}",
-        f"⚪ Security checks are not a guarantee of safety",
-        f"\n<b>⏱️ LAUNCH & DISCOVERY</b>\nAge since bot observed launch: <b>{age_text(first)}</b>",
-        "⚪ Exact on-chain launch age not verified",
-        "⚪ No first-minute market-cap exclusion; launch age remains approximate",
-        f"\n<b>💰 MARKET</b>\nStored cap: {money(row['cap'])}\nSource: {esc(source)}",
-        f"Sample age: {sampled}",
-        f"Latest DEX cap: {money(cap)}\nDEX liquidity: {money(liquidity)}",
-        f"\n<b>🚨 VALUATION WARNINGS</b>\n{risk_lines(flags)}",
-        f"\n<b>👤 CREATOR</b>\n{creator_icon} {esc(creator)}",
-        f"\n<b>🔍 SECURITY DETAILS</b>\n{esc(reasons)}",
-        f"\n<b>📊 NARRATIVE</b>\nCategory: {esc(row['category'] or 'Unclassified')} | Potential: {esc(potential)}",
-        f"\n<b>📋 MINT</b>\n<code>{esc(mint)}</code>",
-    ]
-    if row["passed_at"]:
-        parts.insert(2, f"First PASS recorded: {age_text(row['passed_at'])} ago")
-    if extra:
-        parts.insert(1, esc(extra))
-    return "\n".join(parts)[:4000]
+    lines = [f"<b>{esc(heading)}</b>",
+             f"🛡️ <b>{esc(status)}</b> | Provisional: {esc(f'{score:g}/10' if score is not None else 'N/A')} | Checks: {esc(coverage)}",
+             f"💰 Cap: {esc(money(cap))} | 💧 Liquidity: {esc(money(liq))}"]
+    if lock is not None:
+        lines.append(f"🔒 LP locked: {esc(lock)}")
+    if holders is not None:
+        lines.append(f"👥 Top accounts: {esc(holders)}")
+    if assessment:
+        for warning in assessment["warnings"][:3]:
+            lines.append(f"🔴 {esc(warning)}")
+    lines.append("⚪ Not safety verified; missing checks are excluded from score")
+    lines.append(f"📋 <code>{esc(mint)}</code>")
+    if detailed:
+        lines.append("\n<b>🔍 COMPLETED CHECKS</b>")
+        if assessment:
+            for c in assessment["checks"]:
+                lines.append(f"• {esc(c['name'])}: {esc(c['value'])}" + (f" (-{c['deduction']:g})" if c["deduction"] else ""))
+            lines.append("<b>NOT VERIFIED:</b> " + esc(", ".join(assessment["unverified"])))
+            lines.append("Provider lock data is not independent proof of withdrawal controls.")
+        else:
+            lines.append("No structured screening recorded yet; older scores are not comparable.")
+            lines.append(esc((row["reason"] or "Awaiting screening")[:1000]))
+        lines.append(f"⏱️ Observed by bot: {age_text(row['first_seen'])} ago")
+        lines.append(f"👤 {esc(creator_risk_note(row['creator'], mint))}")
+    return "\n".join(lines)[:3900]
 
 
 def authorized(update):
@@ -703,20 +725,20 @@ async def ranking(update: Update, context: ContextTypes.DEFAULT_TYPE, category=N
         if today:
             # Historical first PASS timestamp, retained even if the state later changes.
             rows = db.execute(
-                "SELECT * FROM tokens WHERE passed_at>=? ORDER BY passed_at DESC LIMIT 100",
+                "SELECT * FROM tokens WHERE state='PRELIMINARY' AND updated_at>=? ORDER BY updated_at DESC LIMIT 100",
                 (time.time() - 86400,)).fetchall()
         elif category:
-            rows = db.execute("SELECT * FROM tokens WHERE state='PASS' AND category=? ORDER BY potential DESC,security DESC LIMIT 10", (category,)).fetchall()
+            rows = db.execute("SELECT * FROM tokens WHERE state='PRELIMINARY' AND category=? ORDER BY potential DESC,security DESC LIMIT 10", (category,)).fetchall()
         else:
-            rows = db.execute("SELECT * FROM tokens WHERE state='PASS' ORDER BY potential DESC,security DESC LIMIT 10").fetchall()
+            rows = db.execute("SELECT * FROM tokens WHERE state='PRELIMINARY' ORDER BY potential DESC,security DESC LIMIT 10").fetchall()
     if not rows:
         await update.message.reply_text(
-            "No coins recorded as PASS in the last 24 hours." if today else
-            "No fully verified qualifying coins yet. Unverified critical checks remain on HOLD.")
+            "No provisional qualifying coins screened in the last 24 hours." if today else
+            "No provisional qualifying coins yet. Try /new or /check <mint>.")
         return
     await update.message.reply_text(
-        "📅 TOPDAY — first passed within 24h; historical PASS does NOT imply still safe." if today else
-        "🏆 TOP — current PASS records (no fixed age window).")
+        "📅 TOPDAY — provisional scores from the last 24h; NOT verified safe." if today else
+        "🏆 TOP — provisional research ranking; NOT verified safe.")
     for row in rows:
         await update.message.reply_text(
             coin_card(row), parse_mode="HTML", reply_markup=mint_keyboard(row['mint']))
@@ -730,7 +752,7 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
     if not context.args:
-        await update.message.reply_text("Usage: /check <Solana mint address>")
+        await update.message.reply_text("Usage: /check <Solana mint> [details]")
         return
     mint = context.args[0]
     if not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", mint):
@@ -739,31 +761,23 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with conn() as db:
         row = db.execute("SELECT * FROM tokens WHERE mint=?", (mint,)).fetchone()
     async with httpx.AsyncClient() as client:
-        pair, rug = await asyncio.gather(market(client, mint), rugcheck_report(client, mint))
-    rug_lines, _ = rugcheck_evidence(rug)
-    rug_message = "\n".join(esc(line) for line in rug_lines)
-    if not row:
-        if not pair:
-            await update.message.reply_text("No local launch record and no matching Solana DEX pair. Launch age and security unverified.")
-            return
-        cap = provider_cap(pair)
-        flags = market_warnings(pair, cap)
-        name = (pair.get("baseToken") or {}).get("name") or "Unknown"
-        symbol = (pair.get("baseToken") or {}).get("symbol") or "?"
-        msg = (f"<b>🪙 {esc(name)} ({esc(symbol)})</b>\n"
-               "⚪ <b>EXTERNAL LOOKUP ONLY — security NOT cleared</b>\n"
-               "⏱️ Launch age: Unknown (not observed locally)\n"
-               f"💰 Provider cap: {money(cap)}\n"
-               f"💧 DEX liquidity: {money(safe_number((pair.get('liquidity') or {}).get('usd')))}\n"
-               f"🚨 <b>Valuation</b>\n{risk_lines(flags)}\n"
-               "⚪ Creator history, mint/freeze authorities, LP security, holder concentration, "
-               "sellability and manipulation NOT checked in this external lookup.\n"
-               f"\n<b>🔒 RUGCHECK & HOLDERS</b>\n{rug_message}\n"
-               f"📋 Mint: <code>{esc(mint)}</code>")
-        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=mint_keyboard(mint))
-        return
-    await update.message.reply_text(coin_card(row, pair), parse_mode="HTML", reply_markup=mint_keyboard(mint))
-    await update.message.reply_text("🔒 <b>LIVE RUGCHECK & HOLDER EVIDENCE</b>\n" + rug_message, parse_mode="HTML")
+        pair = await market(client, mint)
+        if row is None:
+            base = (pair or {}).get("baseToken") or {}
+            record = {"name": base.get("name") or "Unknown", "symbol": base.get("symbol") or "?", "creator": None}
+        else:
+            record = row
+        score, potential, category, state, reason = await inspect(client, mint, record, [])
+    if row is None:
+        with conn() as db:
+            db.execute("INSERT OR IGNORE INTO tokens(mint,name,symbol,first_seen,state,creator) VALUES(?,?,?,?,?,?)",
+                       (mint, record["name"], record["symbol"], time.time(), "NEW", None))
+    with conn() as db:
+        db.execute("UPDATE tokens SET security=?,potential=?,category=?,state=?,reason=?,updated_at=? WHERE mint=?",
+                   (score, potential, category, state, reason, time.time(), mint))
+        row = db.execute("SELECT * FROM tokens WHERE mint=?", (mint,)).fetchone()
+    await update.message.reply_text(coin_card(row, pair, detailed=len(context.args)>1 and context.args[1].lower() in ("details", "full")),
+                                    parse_mode="HTML", reply_markup=mint_keyboard(mint))
 
 
 async def accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
