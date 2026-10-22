@@ -32,6 +32,8 @@ POLL = int(os.getenv("POLL_SECONDS", "15"))
 SOL_PRICE_REFRESH_SECONDS = 90
 MARKET_REFRESH_SECONDS = 30
 RUGCHECK_CACHE_SECONDS = 300
+LEARNING_INTERVAL_SECONDS = 60
+LEARNING_STAGES = (("5m", 300), ("1h", 3600), ("6h", 21600), ("24h", 86400))
 _rug_cache = {}
 # Paid PumpPortal trade streams are intentionally disabled. The AUD amount is
 # a planning ceiling, NOT a provider-side payment limit.
@@ -70,11 +72,102 @@ def init_db():
         CREATE TABLE IF NOT EXISTS news (
           url TEXT PRIMARY KEY, title TEXT, published REAL, fetched REAL);
         CREATE TABLE IF NOT EXISTS watchlist (handle TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS learning_samples (
+          mint TEXT NOT NULL, stage TEXT NOT NULL, due_at REAL NOT NULL,
+          sampled_at REAL NOT NULL, cap REAL, liquidity REAL,
+          status TEXT NOT NULL, PRIMARY KEY(mint,stage));
+        CREATE INDEX IF NOT EXISTS learning_due_idx ON learning_samples(stage,due_at);
+        CREATE TABLE IF NOT EXISTS learning_baselines (
+          mint TEXT PRIMARY KEY, sampled_at REAL NOT NULL, cap REAL,
+          liquidity REAL, security REAL, coverage INTEGER, creator TEXT,
+          top_accounts REAL, lp_locked REAL);
         """)
         columns = {r[1] for r in db.execute("PRAGMA table_info(tokens)")}
         for name, dtype in (("launch_cap_sol", "REAL"), ("cap_source", "TEXT"), ("cap_observed_at", "REAL"), ("threshold_alerted_at", "REAL"), ("creator", "TEXT"), ("early_high", "INTEGER DEFAULT 0"), ("early_dex_seen", "INTEGER DEFAULT 0"), ("passed_at", "REAL"), ("liquidity", "REAL"), ("liquidity_observed_at", "REAL")):
             if name not in columns:
                 db.execute(f"ALTER TABLE tokens ADD COLUMN {name} {dtype}")
+
+
+def learning_baseline(mint, pair=None, assessment=None):
+    """First usable DEX observation only; never backfill from later outcomes."""
+    cap = provider_cap(pair)
+    liq = safe_number((pair.get("liquidity") or {}).get("usd")) if pair else None
+    if cap is None and liq is None:
+        return
+    checks = (assessment or {}).get("checks", [])
+    def observed(name):
+        for check in checks:
+            if check.get("name") == name:
+                return check.get("value")
+        return None
+    top = observed("Top 5 accounts")
+    lock = observed("LP locked (Rugcheck)")
+    def percentage(text):
+        try:
+            return float(str(text).split("%", 1)[0])
+        except (TypeError, ValueError):
+            return None
+    with conn() as db:
+        db.execute("""INSERT OR IGNORE INTO learning_baselines
+          (mint,sampled_at,cap,liquidity,security,coverage,creator,top_accounts,lp_locked)
+          SELECT ?,?,?,?,?,?,?,?,? WHERE EXISTS(SELECT 1 FROM tokens WHERE mint=?)""",
+          (mint, time.time(), cap, liq, (assessment or {}).get("score"),
+           (assessment or {}).get("completed"), None, percentage(top), percentage(lock), mint))
+        if assessment:
+            db.execute("""UPDATE learning_baselines SET
+              security=COALESCE(security,?), coverage=COALESCE(coverage,?),
+              top_accounts=COALESCE(top_accounts,?), lp_locked=COALESCE(lp_locked,?)
+              WHERE mint=?""", ((assessment or {}).get('score'),
+              (assessment or {}).get('completed'), percentage(top), percentage(lock), mint))
+
+
+async def learning_worker():
+    """Track every observed launch independently of the alert/safety threshold.
+
+    Missing DEX readings are recorded as missing, never as a crash or zero cap.
+    A stage is sampled near its due time; later stages remain eligible.
+    """
+    async with httpx.AsyncClient() as client:
+        while True:
+            try:
+                now = time.time()
+                with conn() as db:
+                    # Prioritize older due checkpoints, and never sample a stage twice.
+                    rows = db.execute("""SELECT t.mint,t.first_seen FROM tokens t
+                        WHERE t.first_seen <= ? AND t.first_seen > ?
+                        AND EXISTS (SELECT 1 FROM (SELECT '5m' stage,300 delay
+                          UNION ALL SELECT '1h',3600 UNION ALL SELECT '6h',21600
+                          UNION ALL SELECT '24h',86400) stages
+                          WHERE t.first_seen+stages.delay<=?
+                          AND NOT EXISTS(SELECT 1 FROM learning_samples s
+                            WHERE s.mint=t.mint AND s.stage=stages.stage))
+                        ORDER BY t.first_seen ASC LIMIT 15""",
+                        (now-300, now-86400*3, now)).fetchall()
+                for row in rows:
+                    mint, seen = row['mint'], row['first_seen']
+                    pair = await market(client, mint)
+                    cap = provider_cap(pair)
+                    liq = safe_number((pair.get('liquidity') or {}).get('usd')) if pair else None
+                    sampled = time.time()
+                    learning_baseline(mint, pair)
+                    with conn() as db:
+                        for stage, delay in LEARNING_STAGES:
+                            due = seen + delay
+                            if sampled >= due:
+                                # A stale observation cannot represent an earlier checkpoint.
+                                late = sampled - due > max(180, delay * 0.1)
+                                db.execute("""INSERT OR IGNORE INTO learning_samples
+                                    (mint,stage,due_at,sampled_at,cap,liquidity,status)
+                                    VALUES (?,?,?,?,?,?,?)""",
+                                    (mint, stage, due, sampled, None if late else cap,
+                                     None if late else liq,
+                                     'late' if late else 'observed' if cap is not None or liq is not None else 'missing'))
+                    await asyncio.sleep(0.2)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                log.exception("Learning tracker iteration failed")
+            await asyncio.sleep(LEARNING_INTERVAL_SECONDS)
 
 
 def creator_launch_count(creator, exclude_mint=None):
@@ -538,6 +631,7 @@ async def worker(application, queue):
             for row, pair in zip(rows, pairs):
                 mint = row["mint"]
                 dex_cap = provider_cap(pair)
+                learning_baseline(mint, pair)
                 dex_liquidity = safe_number((pair.get("liquidity") or {}).get("usd")) if pair else None
                 cap, source = None, None
                 # Prefer a recently fetched DEX provider observation over the launch snapshot.
@@ -589,6 +683,8 @@ async def worker(application, queue):
                         "UPDATE tokens SET security=?,potential=?,category=?,state=?,reason=?,updated_at=?,passed_at=CASE WHEN ?='PASS' THEN COALESCE(passed_at, ?) ELSE passed_at END WHERE mint=?",
                         (score, potential, category, state, reason, time.time(), state, time.time(), mint))
                 assessment = decode_assessment(reason) or {}
+                # Enrich only if the baseline was not previously captured.
+                learning_baseline(mint, pair, assessment)
                 result_label = {
                     "PRELIMINARY": "Provisional research result — NOT safety verified",
                     "REJECT": "Below the configured provisional score threshold",
@@ -715,7 +811,7 @@ def authorized(update):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if authorized(update):
-        await update.message.reply_text("Pump.fun research bot online. /new (early discoveries; launch cap estimates are NOT live or verified) /status /top /topday /news /viral /phrases /original /culture /remix /check <mint> /accounts /addaccount <handle> /removeaccount <handle>\n\nHOLD means critical security checks are unverified. No trading.")
+        await update.message.reply_text("Pump.fun research bot online. /new (early discoveries; launch cap estimates are NOT live or verified) /status /top /topday /news /viral /phrases /original /culture /remix /check <mint> /learning /accounts /addaccount <handle> /removeaccount <handle>\n\nHOLD means critical security checks are unverified. No trading.")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -819,6 +915,30 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                     parse_mode="HTML", reply_markup=mint_keyboard(mint))
 
 
+async def learning(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    with conn() as db:
+        discovered = db.execute("SELECT COUNT(*) FROM tokens").fetchone()[0]
+        baselines = db.execute("SELECT COUNT(*) FROM learning_baselines").fetchone()[0]
+        samples = db.execute("SELECT stage,status,COUNT(*) n FROM learning_samples GROUP BY stage,status").fetchall()
+        winners = db.execute("""SELECT COUNT(*) FROM learning_baselines b
+          JOIN learning_samples s ON b.mint=s.mint AND s.stage='24h'
+          WHERE b.cap>0 AND s.cap>=b.cap*2""").fetchone()[0]
+        measured = db.execute("""SELECT COUNT(*) FROM learning_baselines b
+          JOIN learning_samples s ON b.mint=s.mint AND s.stage='24h'
+          WHERE b.cap>0 AND s.cap IS NOT NULL""").fetchone()[0]
+    by_stage = [f"{stage}: {status} {n}" for stage,status,n in samples]
+    await update.message.reply_text(
+        f"🧠 LEARNING TRACKER (data collection only)\n"
+        f"Launches recorded: {discovered}\n"
+        f"DEX baselines: {baselines}\n"
+        f"24h >=2x baseline: {winners}/{measured} measurable\n"
+        + ("\n".join(by_stage) if by_stage else "No follow-up samples yet")
+        + "\nNo trained model or predictive score yet. Missing data is not a failure."
+        + "\nKeep BOT_DB_PATH on persistent storage to retain history.")
+
+
 async def accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update): return
     with conn() as db:
@@ -848,6 +968,7 @@ async def post_init(application):
     application.bot_data["tasks"] = [
         asyncio.create_task(launch_stream(queue)),
         asyncio.create_task(worker(application, queue)),
+        asyncio.create_task(learning_worker()),
     ]
 
 
@@ -870,6 +991,7 @@ def main():
             await ranking(update, context, category)
         application.add_handler(CommandHandler(key, handler))
     application.add_handler(CommandHandler("check", check))
+    application.add_handler(CommandHandler("learning", learning))
     application.add_handler(CommandHandler("accounts", accounts))
     application.add_handler(CommandHandler("addaccount", lambda u,c: edit_account(u,c,False)))
     application.add_handler(CommandHandler("removeaccount", lambda u,c: edit_account(u,c,True)))
