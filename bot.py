@@ -31,6 +31,8 @@ MIN_SCORE = float(os.getenv("MIN_SECURITY_SCORE", "5"))
 POLL = int(os.getenv("POLL_SECONDS", "15"))
 SOL_PRICE_REFRESH_SECONDS = 90
 MARKET_REFRESH_SECONDS = 30
+RUGCHECK_CACHE_SECONDS = 300
+_rug_cache = {}
 # Paid PumpPortal trade streams are intentionally disabled. The AUD amount is
 # a planning ceiling, NOT a provider-side payment limit.
 PAID_STREAM_ENABLED = False
@@ -242,6 +244,77 @@ async def largest_accounts(client, mint):
         return None
 
 
+async def rugcheck_report(client, mint):
+    """Read public Rugcheck summary and detailed report; missing data stays unknown."""
+    cached = _rug_cache.get(mint)
+    if cached and time.time() - cached[0] < RUGCHECK_CACHE_SECONDS:
+        return cached[1]
+    result = {"summary": None, "full": None, "errors": []}
+    for kind, suffix in (("summary", "/report/summary"), ("full", "/report")):
+        try:
+            response = await client.get(
+                f"https://api.rugcheck.xyz/v1/tokens/{mint}{suffix}",
+                headers={"Accept": "application/json"}, timeout=9)
+            response.raise_for_status()
+            payload = response.json()
+            if isinstance(payload, dict) and not payload.get("error"):
+                result[kind] = payload
+            else:
+                result["errors"].append(f"{kind}: unexpected response")
+        except (httpx.HTTPError, ValueError, TypeError) as exc:
+            # Avoid including any request headers or secrets in user-facing output.
+            result["errors"].append(f"{kind}: {type(exc).__name__}")
+    _rug_cache[mint] = (time.time(), result)
+    if len(_rug_cache) > 500:
+        _rug_cache.pop(next(iter(_rug_cache)))
+    return result
+
+
+def rugcheck_evidence(report):
+    """Provider findings are evidence indicators, never independent verification."""
+    summary = report.get("summary") or {}
+    full = report.get("full") or {}
+    data = summary if summary else full
+    lines = []
+    if not data:
+        lines.append("⚪ Rugcheck: unavailable (public endpoint/rate limit/network); no inference")
+        return lines, None
+    lines.append("🟡 Rugcheck: provider report retrieved (not an independent audit)")
+    lock = data.get("lpLockedPct")
+    if lock is None:
+        lock = full.get("lpLockedPct")
+    if isinstance(lock, (float, int)) and not isinstance(lock, bool) and 0 <= lock <= 100:
+        lines.append(f"🟡 Rugcheck-reported LP locked: {lock:g}% (pool coverage and withdrawal rights NOT independently verified)")
+    else:
+        lines.append("⚪ Rugcheck LP locked percentage: not reported / not applicable")
+    risks = data.get("risks")
+    if not isinstance(risks, list):
+        risks = full.get("risks")
+    if isinstance(risks, list):
+        if risks:
+            for risk in risks[:6]:
+                if isinstance(risk, dict):
+                    name = str(risk.get("name") or "Unspecified risk")[:65]
+                    level = str(risk.get("level") or "unknown").lower()
+                    marker = "🔴" if level in ("danger", "error", "critical") else "🟡"
+                    lines.append(f"{marker} Rugcheck: {name} (severity: {level[:20]})")
+        else:
+            lines.append("⚪ Rugcheck: no listed risks in this report (not proof of safety)")
+    holders = full.get("topHolders")
+    if isinstance(holders, list) and holders:
+        # Holder accounts are not necessarily independent beneficial owners.
+        percentages = [h.get("pct") for h in holders[:10] if isinstance(h, dict)]
+        percentages = [float(p) for p in percentages if isinstance(p, (int, float)) and not isinstance(p, bool) and 0 <= p <= 100]
+        if percentages:
+            lines.append(f"🟡 Rugcheck top {len(percentages)} reported token accounts: {sum(percentages):.1f}% (may include pools)")
+        else:
+            lines.append("⚪ Rugcheck holder entries returned, percentages unavailable")
+    else:
+        lines.append("⚪ Rugcheck detailed holder percentages unavailable")
+    lines.append("⚪ Linked-wallet ownership and real sell execution NOT verified")
+    return lines, lock
+
+
 def liquidity_and_sellability_evidence(authority, pair):
     """Conservative, observable indicators; never assert a successful sell or LP lock."""
     findings = []
@@ -281,8 +354,9 @@ def liquidity_and_sellability_evidence(authority, pair):
 
 
 async def inspect(client, mint, record, headlines):
-    authority, pair, concentration = await asyncio.gather(
-        check_authorities(client, mint), market(client, mint), largest_accounts(client, mint)
+    authority, pair, concentration, rug = await asyncio.gather(
+        check_authorities(client, mint), market(client, mint), largest_accounts(client, mint),
+        rugcheck_report(client, mint)
     )
     flags = []
     score = 10.0
@@ -331,6 +405,8 @@ async def inspect(client, mint, record, headlines):
     # Holder concentration counts token accounts, not beneficial owners or linked wallets.
     evidence, unresolved = liquidity_and_sellability_evidence(authority, pair)
     flags.extend(evidence)
+    rug_lines, _ = rugcheck_evidence(rug)
+    flags.extend(rug_lines)
     critical_unknown = critical_unknown or unresolved
     flags.append("⚪ Wash trading and linked-wallet manipulation NOT verified")
     score = max(0.0, min(10.0, score))
@@ -663,7 +739,9 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
     with conn() as db:
         row = db.execute("SELECT * FROM tokens WHERE mint=?", (mint,)).fetchone()
     async with httpx.AsyncClient() as client:
-        pair = await market(client, mint)
+        pair, rug = await asyncio.gather(market(client, mint), rugcheck_report(client, mint))
+    rug_lines, _ = rugcheck_evidence(rug)
+    rug_message = "\n".join(esc(line) for line in rug_lines)
     if not row:
         if not pair:
             await update.message.reply_text("No local launch record and no matching Solana DEX pair. Launch age and security unverified.")
@@ -680,10 +758,12 @@ async def check(update: Update, context: ContextTypes.DEFAULT_TYPE):
                f"🚨 <b>Valuation</b>\n{risk_lines(flags)}\n"
                "⚪ Creator history, mint/freeze authorities, LP security, holder concentration, "
                "sellability and manipulation NOT checked in this external lookup.\n"
+               f"\n<b>🔒 RUGCHECK & HOLDERS</b>\n{rug_message}\n"
                f"📋 Mint: <code>{esc(mint)}</code>")
         await update.message.reply_text(msg, parse_mode="HTML", reply_markup=mint_keyboard(mint))
         return
     await update.message.reply_text(coin_card(row, pair), parse_mode="HTML", reply_markup=mint_keyboard(mint))
+    await update.message.reply_text("🔒 <b>LIVE RUGCHECK & HOLDER EVIDENCE</b>\n" + rug_message, parse_mode="HTML")
 
 
 async def accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
