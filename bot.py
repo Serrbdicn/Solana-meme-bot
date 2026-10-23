@@ -88,6 +88,7 @@ def init_db():
           sampled_at REAL NOT NULL, cap REAL, liquidity REAL,
           status TEXT NOT NULL, PRIMARY KEY(mint,stage));
         CREATE INDEX IF NOT EXISTS learning_due_idx ON learning_samples(stage,due_at);
+        CREATE TABLE IF NOT EXISTS wallet_evidence (mint TEXT PRIMARY KEY, checked_at REAL NOT NULL, evidence TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS learning_baselines (
           mint TEXT PRIMARY KEY, sampled_at REAL NOT NULL, cap REAL,
           liquidity REAL, security REAL, coverage INTEGER, creator TEXT,
@@ -582,6 +583,86 @@ def assess_checks(authority, pair, concentration, rug, creator, mint):
             "label": "PROVISIONAL — NOT SAFETY VERIFIED"}
 
 
+
+async def wallet_scan(client, mint):
+    """Read-only bounded transaction sample, not a definitive bundle audit."""
+    result = {"status": "INCONCLUSIVE", "inspected": 0, "recipients": 0, "multi_recipient_txs": 0}
+    signatures = await rpc(client, "getSignaturesForAddress", [mint, {"limit": 40}])
+    if not isinstance(signatures, list):
+        return result
+    sigs = [x["signature"] for x in signatures if isinstance(x, dict) and x.get("signature") and x.get("err") is None][:24]
+    sem = asyncio.Semaphore(3)
+    async def fetch(sig):
+        async with sem:
+            return await rpc(client, "getTransaction", [sig, {"encoding": "jsonParsed", "maxSupportedTransactionVersion": 0}])
+    txs = await asyncio.gather(*(fetch(sig) for sig in sigs))
+    all_owners = set()
+    for tx in txs:
+        if not isinstance(tx, dict) or not isinstance(tx.get("meta"), dict):
+            continue
+        result["inspected"] += 1
+        meta = tx["meta"]
+        maps = []
+        for balances in (meta.get("preTokenBalances") or [], meta.get("postTokenBalances") or []):
+            values = {}
+            for b in balances:
+                if b.get("mint") == mint and b.get("owner"):
+                    try:
+                        values[(b["owner"], b.get("accountIndex"))] = int(b["uiTokenAmount"]["amount"])
+                    except (KeyError, ValueError, TypeError):
+                        pass
+            maps.append(values)
+        pre, post = maps
+        gained = {k[0] for k in set(pre) | set(post) if post.get(k, 0) > pre.get(k, 0)}
+        all_owners.update(gained)
+        if len(gained) >= 2:
+            result["multi_recipient_txs"] += 1
+    result["recipients"] = len(all_owners)
+    if result["multi_recipient_txs"]:
+        result["status"] = "REVIEW"
+    elif result["inspected"]:
+        result["status"] = "NO_SIGNAL_IN_SAMPLE"
+    return result
+
+
+def saved_wallet(mint):
+    with conn() as db:
+        row = db.execute("SELECT checked_at,evidence FROM wallet_evidence WHERE mint=?", (mint,)).fetchone()
+    if row:
+        try:
+            return json.loads(row["evidence"]), row["checked_at"]
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+async def wallet(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    if not context.args or not re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", context.args[0]):
+        await update.message.reply_text("Usage: /wallet <Solana mint>")
+        return
+    mint = context.args[0]
+    cached = saved_wallet(mint)
+    if cached and time.time() - cached[1] < 900:
+        result = cached[0]
+    else:
+        async with httpx.AsyncClient(timeout=12) as client:
+            result = await wallet_scan(client, mint)
+        with conn() as db:
+            db.execute("INSERT OR REPLACE INTO wallet_evidence VALUES(?,?,?)",
+                       (mint, time.time(), json.dumps(result)))
+    msg = (f"👛 WALLET SAMPLE: {result['status']}\n"
+           f"📋 <code>{esc(mint)}</code>\n"
+           f"Transactions inspected: {result['inspected']}/24 maximum\n"
+           f"Distinct receiving wallets: {result['recipients']}\n"
+           f"Transactions with multiple receiving wallets: {result['multi_recipient_txs']}\n"
+           "⚠️ A multi-recipient transaction may be ordinary routing, not a bundle. "
+           "No signal in this sample does NOT mean no bundles. "
+           "Funding links, launch-time bundles, creator links and sellability remain unverified.")
+    await update.message.reply_text(msg, parse_mode="HTML", reply_markup=mint_keyboard(mint))
+
+
 def encode_assessment(assessment):
     return "SAFETY_JSON:" + json.dumps(assessment, ensure_ascii=False, separators=(",", ":"))
 
@@ -855,7 +936,7 @@ def coin_card(row, pair=None, title=None, extra=None, detailed=False):
     status = row["state"] or "NEW"
     heading = title or f"🪙 {row['name'] or 'Unnamed'} ({row['symbol'] or '?'})"
     lines = [f"<b>{esc(heading)}</b>",
-             f"🛡️ <b>{esc(status)}</b> | Provisional: {esc(f'{score:g}/10' if score is not None else 'N/A')} | Checks: {esc(coverage)}",
+             f"🛡️ <b>{esc(status)}</b> | Observed-check score (NOT verified safety): {esc(f'{score:g}/10' if score is not None else 'N/A')} | Checks: {esc(coverage)}",
              f"💰 Cap: {esc(money(cap))} · {esc(cap_note)}",
              f"💧 Liquidity: {esc(money(liq))} · {esc(liq_note)}"]
     if lock is not None:
@@ -865,6 +946,12 @@ def coin_card(row, pair=None, title=None, extra=None, detailed=False):
     if assessment:
         for warning in assessment["warnings"][:3]:
             lines.append(f"🔴 {esc(warning)}")
+    wallet_record = saved_wallet(mint)
+    if wallet_record:
+        w = wallet_record[0]
+        lines.append(f"👛 Wallet sample: {esc(w['status'])} · {w['inspected']} tx inspected")
+    else:
+        lines.append("👛 Wallet bundles: unverified · use /wallet &lt;mint&gt;")
     lines.append("⚪ Not safety verified; missing checks are excluded from score")
     lines.append(f"📋 <code>{esc(mint)}</code>")
     if detailed:
@@ -1153,6 +1240,7 @@ def main():
             await ranking(update, context, category)
         application.add_handler(CommandHandler(key, handler))
     application.add_handler(CommandHandler("check", check))
+    application.add_handler(CommandHandler("wallet", wallet))
     application.add_handler(CommandHandler("learning", learning))
     application.add_handler(CommandHandler("patterns", patterns))
     application.add_handler(CommandHandler("narratives", narratives))
