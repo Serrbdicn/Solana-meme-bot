@@ -39,7 +39,13 @@ _rug_cache = {}
 # a planning ceiling, NOT a provider-side payment limit.
 PAID_STREAM_ENABLED = False
 PAID_STREAM_BUDGET_AUD = 5.0
-RSS = [u.strip() for u in os.getenv("RSS_URLS", "").split(",") if u.strip()]
+DEFAULT_NARRATIVE_RSS = [
+    "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "https://feeds.bbci.co.uk/news/technology/rss.xml",
+    "https://www.reddit.com/r/OutOfTheLoop/.rss",
+    "https://www.reddit.com/r/memes/.rss",
+]
+RSS = [u.strip() for u in os.getenv("RSS_URLS", ",".join(DEFAULT_NARRATIVE_RSS)).split(",") if u.strip()][:12]
 DB = Path(os.getenv("BOT_DB_PATH", "data/bot.db"))
 DB.parent.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -72,6 +78,11 @@ def init_db():
         CREATE TABLE IF NOT EXISTS news (
           url TEXT PRIMARY KEY, title TEXT, published REAL, fetched REAL);
         CREATE TABLE IF NOT EXISTS watchlist (handle TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS narrative_matches (
+          mint TEXT PRIMARY KEY, headline TEXT NOT NULL, url TEXT NOT NULL,
+          headline_published REAL NOT NULL, matched_at REAL NOT NULL,
+          overlap INTEGER NOT NULL, evidence TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS narrative_time_idx ON narrative_matches(matched_at);
         CREATE TABLE IF NOT EXISTS learning_samples (
           mint TEXT NOT NULL, stage TEXT NOT NULL, due_at REAL NOT NULL,
           sampled_at REAL NOT NULL, cap REAL, liquidity REAL,
@@ -194,6 +205,43 @@ def creator_risk_note(creator, mint):
 def words(s):
     return set(re.findall(r"[a-z0-9]{3,}", (s or "").lower())) - {
         "the", "and", "with", "for", "coin", "token", "official", "pump"}
+
+
+def narrative_candidate(name, symbol, headlines, seen_at=None):
+    """Record only source headlines already published by discovery time.
+
+    This is lexical evidence, NOT verified causation or measured virality.
+    """
+    seen_at = seen_at or time.time()
+    token_words = words((name or "") + " " + (symbol or ""))
+    # Avoid false matches from generic short symbols and common filler words.
+    token_words -= {"new", "moon", "meme", "crypto", "solana", "pumpfun", "based", "world", "today", "news"}
+    if not token_words:
+        return None
+    best = None
+    for item in headlines:
+        published = item.get("published", 0)
+        if not (seen_at - 86400 <= published <= seen_at + 60):
+            continue
+        overlap = token_words & words(item.get("title", ""))
+        if not overlap:
+            continue
+        rank = (len(overlap), published)
+        if best is None or rank > best[0]:
+            best = (rank, item, overlap)
+    return best
+
+
+def save_narrative_match(mint, name, symbol, headlines, seen_at):
+    match = narrative_candidate(name, symbol, headlines, seen_at)
+    if not match:
+        return
+    _, item, overlap = match
+    with conn() as db:
+        db.execute("""INSERT OR IGNORE INTO narrative_matches
+          (mint,headline,url,headline_published,matched_at,overlap,evidence)
+          VALUES (?,?,?,?,?,?,?)""", (mint, item['title'][:240], item['url'][:700],
+          item['published'], seen_at, len(overlap), ', '.join(sorted(overlap))))
 
 
 def category_and_potential(name, symbol, headlines):
@@ -544,7 +592,8 @@ async def fetch_headlines(client):
             parsed = feedparser.parse(response.text)
             for e in parsed.entries[:35]:
                 struct = e.get("published_parsed") or e.get("updated_parsed")
-                stamp = time.mktime(struct) if struct else time.time()
+                import calendar
+                stamp = calendar.timegm(struct) if struct else time.time()
                 result.append({"title": e.get("title", ""), "url": e.get("link", ""), "published": stamp})
         except (httpx.HTTPError, ValueError) as exc:
             log.warning("RSS unavailable: %s", exc)
@@ -613,6 +662,8 @@ async def worker(application, queue):
                     creator = event.get("traderPublicKey")
                     if isinstance(creator, str) and re.fullmatch(r"[1-9A-HJ-NP-Za-km-z]{32,44}", creator):
                         db.execute("UPDATE tokens SET creator=COALESCE(creator, ?) WHERE mint=?", (creator, mint))
+                save_narrative_match(mint, str(event.get("name", ""))[:100],
+                                     str(event.get("symbol", ""))[:30], headlines, observed)
                 queue.task_done()
             # Avoid excessive provider polling: cap checks are spaced per token.
             with conn() as db:
@@ -811,7 +862,7 @@ def authorized(update):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if authorized(update):
-        await update.message.reply_text("Pump.fun research bot online. /new (early discoveries; launch cap estimates are NOT live or verified) /status /top /topday /news /viral /phrases /original /culture /remix /check <mint> /learning /accounts /addaccount <handle> /removeaccount <handle>\n\nHOLD means critical security checks are unverified. No trading.")
+        await update.message.reply_text("Pump.fun research bot online. /new (early discoveries; launch cap estimates are NOT live or verified) /status /top /topday /news /viral /phrases /original /culture /remix /check <mint> /learning /patterns /narratives /accounts /addaccount <handle> /removeaccount <handle>\n\nHOLD means critical security checks are unverified. No trading.")
 
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -939,6 +990,61 @@ async def learning(update: Update, context: ContextTypes.DEFAULT_TYPE):
         + "\nKeep BOT_DB_PATH on persistent storage to retain history.")
 
 
+async def narratives(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    with conn() as db:
+        count = db.execute("SELECT COUNT(*) FROM narrative_matches").fetchone()[0]
+        rows = db.execute("""SELECT n.headline,n.url,n.evidence,n.overlap,
+             COUNT(*) AS coins,MAX(n.matched_at) AS last_seen
+             FROM narrative_matches n WHERE n.matched_at>?
+             GROUP BY n.url ORDER BY coins DESC,last_seen DESC LIMIT 6""",
+             (time.time()-86400,)).fetchall()
+    lines = [f"🌍 NARRATIVE WATCH (RSS evidence only)",
+             f"Historical coin/headline matches: {count}",
+             "Not verified viral; name overlap does not establish a connection."]
+    for r in rows:
+        lines.append(f"\n• {r['headline'][:90]}\n  {r['coins']} matching coin(s) · words: {r['evidence']}\n  {r['url']}")
+    if not rows:
+        lines.append("No recent matches. Feeds may be unavailable or coin names unrelated.")
+    await update.message.reply_text("\n".join(lines)[:3900], disable_web_page_preview=True)
+
+
+async def patterns(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not authorized(update):
+        return
+    with conn() as db:
+        baseline_count = db.execute("SELECT COUNT(*) FROM learning_baselines WHERE cap>0").fetchone()[0]
+        lines = ["🧠 HISTORICAL PATTERNS (descriptive only)",
+                 f"Usable cap baselines: {baseline_count}"]
+        for stage in ("5m", "1h", "6h", "24h"):
+            row = db.execute("""SELECT COUNT(*) AS n,
+              SUM(CASE WHEN s.cap>=2*b.cap THEN 1 ELSE 0 END) AS doubles,
+              SUM(CASE WHEN s.cap<=0.5*b.cap THEN 1 ELSE 0 END) AS halves
+              FROM learning_baselines b JOIN learning_samples s ON b.mint=s.mint
+              WHERE s.stage=? AND s.status='observed' AND b.cap>0 AND s.cap IS NOT NULL""", (stage,)).fetchone()
+            n=row['n']; doubles=row['doubles'] or 0; halves=row['halves'] or 0
+            lines.append(f"{stage}: {n} valid · ≥2× {doubles} ({100*doubles/n:.1f}%) · ≤0.5× {halves} ({100*halves/n:.1f}%)" if n else f"{stage}: no valid cap outcomes")
+        for label, clause, params in (
+            ("Initial liquidity ≥$10k", "b.liquidity>=10000", ()),
+            ("Initial liquidity <$3k", "b.liquidity<3000", ())):
+            row=db.execute(f"""SELECT COUNT(*) AS n,
+                SUM(CASE WHEN s.cap>=2*b.cap THEN 1 ELSE 0 END) AS winners
+                FROM learning_baselines b JOIN learning_samples s ON b.mint=s.mint
+                WHERE s.stage='1h' AND s.status='observed' AND b.cap>0
+                  AND s.cap IS NOT NULL AND {clause}""",params).fetchone()
+            n=row['n']; wins=row['winners'] or 0
+            lines.append(f"{label} (1h): {wins}/{n} ≥2×" if n else f"{label} (1h): no samples")
+        row=db.execute("""SELECT COUNT(*) AS n,
+             SUM(CASE WHEN s.cap>=2*b.cap THEN 1 ELSE 0 END) AS winners
+             FROM narrative_matches m JOIN learning_baselines b ON m.mint=b.mint
+             JOIN learning_samples s ON s.mint=b.mint
+             WHERE s.stage='1h' AND s.status='observed' AND b.cap>0 AND s.cap IS NOT NULL""").fetchone()
+        lines.append(f"Narrative matches (1h): {row['winners'] or 0}/{row['n']} ≥2×")
+    lines.append("Late/missing samples excluded. Small or biased samples are unreliable; no predictive model trained.")
+    await update.message.reply_text("\n".join(lines))
+
+
 async def accounts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update): return
     with conn() as db:
@@ -992,6 +1098,8 @@ def main():
         application.add_handler(CommandHandler(key, handler))
     application.add_handler(CommandHandler("check", check))
     application.add_handler(CommandHandler("learning", learning))
+    application.add_handler(CommandHandler("patterns", patterns))
+    application.add_handler(CommandHandler("narratives", narratives))
     application.add_handler(CommandHandler("accounts", accounts))
     application.add_handler(CommandHandler("addaccount", lambda u,c: edit_account(u,c,False)))
     application.add_handler(CommandHandler("removeaccount", lambda u,c: edit_account(u,c,True)))
