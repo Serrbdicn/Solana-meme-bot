@@ -202,20 +202,37 @@ def creator_risk_note(creator, mint):
     return f"Creator wallet observed; {count} other local launches (external history NOT checked)"
 
 
+# Generic words are never evidence of a news-to-coin connection.
+NARRATIVE_STOPWORDS = set("""the and with for from are was were has have had this that these those
+into onto over under after before about amid says said say will would could should
+its their his her our your you they them who whom what when where why how can may
+new latest today yesterday tomorrow news world report reports reported live video
+watch moment man woman people person one two three first last more most less
+some any all not but yet out off via per near just now then than also still
+coin token official pump crypto solana meme moon based trend trending update
+updates breaking story stories article articles source footage clip clips
+there here been being does did doing gets got get it's its an a as at be by
+in is it of on or to up us we he she do if so no yes top""".split())
+NARRATIVE_ALIASES = {
+    "elon": "elon musk", "musk": "elon musk", "tesla": "tesla", "cybertruck": "cybertruck",
+    "doge": "dogecoin", "dogecoin": "dogecoin", "trump": "donald trump",
+    "bitcoin": "bitcoin", "btc": "bitcoin", "ethereum": "ethereum",
+}
+
+
 def words(s):
-    return set(re.findall(r"[a-z0-9]{3,}", (s or "").lower())) - {
-        "the", "and", "with", "for", "coin", "token", "official", "pump"}
+    tokens = set(re.findall(r"[a-z0-9]{3,}", (s or "").lower()))
+    return {w for w in tokens if w not in NARRATIVE_STOPWORDS and not w.isdigit()}
 
 
 def narrative_candidate(name, symbol, headlines, seen_at=None):
-    """Record only source headlines already published by discovery time.
+    """Conservative headline overlap. Single generic words never qualify.
 
-    This is lexical evidence, NOT verified causation or measured virality.
+    A distinctive exact token of >=5 characters may qualify; otherwise require
+    two independent informative words. RSS does not prove social virality.
     """
     seen_at = seen_at or time.time()
     token_words = words((name or "") + " " + (symbol or ""))
-    # Avoid false matches from generic short symbols and common filler words.
-    token_words -= {"new", "moon", "meme", "crypto", "solana", "pumpfun", "based", "world", "today", "news"}
     if not token_words:
         return None
     best = None
@@ -223,10 +240,13 @@ def narrative_candidate(name, symbol, headlines, seen_at=None):
         published = item.get("published", 0)
         if not (seen_at - 86400 <= published <= seen_at + 60):
             continue
-        overlap = token_words & words(item.get("title", ""))
-        if not overlap:
+        headline_words = words(item.get("title", ""))
+        overlap = token_words & headline_words
+        # Only distinctive names or multi-word evidence can trigger a match.
+        distinctive = {w for w in overlap if len(w) >= 5}
+        if not distinctive and len(overlap) < 2:
             continue
-        rank = (len(overlap), published)
+        rank = (len(overlap), max(map(len, overlap)), published)
         if best is None or rank > best[0]:
             best = (rank, item, overlap)
     return best
@@ -238,10 +258,16 @@ def save_narrative_match(mint, name, symbol, headlines, seen_at):
         return
     _, item, overlap = match
     with conn() as db:
-        db.execute("""INSERT OR IGNORE INTO narrative_matches
+        db.execute("""INSERT OR REPLACE INTO narrative_matches
           (mint,headline,url,headline_published,matched_at,overlap,evidence)
           VALUES (?,?,?,?,?,?,?)""", (mint, item['title'][:240], item['url'][:700],
           item['published'], seen_at, len(overlap), ', '.join(sorted(overlap))))
+
+
+def narrative_match_valid(evidence):
+    """Exclude older bogus records such as 'from' and 'are' at display time."""
+    matches = words(evidence or "")
+    return bool(any(len(w) >= 5 for w in matches) or len(matches) >= 2)
 
 
 def category_and_potential(name, symbol, headlines):
@@ -909,7 +935,6 @@ async def ranking(update: Update, context: ContextTypes.DEFAULT_TYPE, category=N
         return
     with conn() as db:
         if today:
-            # Historical first PASS timestamp, retained even if the state later changes.
             rows = db.execute(
                 "SELECT * FROM tokens WHERE state='PRELIMINARY' AND updated_at>=? ORDER BY updated_at DESC LIMIT 100",
                 (time.time() - 86400,)).fetchall()
@@ -917,17 +942,40 @@ async def ranking(update: Update, context: ContextTypes.DEFAULT_TYPE, category=N
             rows = db.execute("SELECT * FROM tokens WHERE state='PRELIMINARY' AND category=? ORDER BY potential DESC,security DESC LIMIT 10", (category,)).fetchall()
         else:
             rows = db.execute("SELECT * FROM tokens WHERE state='PRELIMINARY' ORDER BY potential DESC,security DESC LIMIT 10").fetchall()
+        matches = {}
+        for r in rows:
+            match = db.execute("""SELECT headline,url,evidence FROM narrative_matches
+                 WHERE mint=? ORDER BY matched_at DESC LIMIT 1""", (r['mint'],)).fetchone()
+            if match and narrative_match_valid(match['evidence']):
+                matches[r['mint']] = dict(match)
     if not rows:
         await update.message.reply_text(
             "No provisional qualifying coins screened in the last 24 hours." if today else
             "No provisional qualifying coins yet. Try /new or /check <mint>.")
         return
     await update.message.reply_text(
-        "📅 TOPDAY — provisional scores from the last 24h; NOT verified safe." if today else
-        "🏆 TOP — provisional research ranking; NOT verified safe.")
+        "📅 TOPDAY — provisional research; NOT verified safe." if today else
+        "🏆 TOP — safety + narrative research; NOT verified safe."
+        "\nHeadline matches are unverified associations, not proof of virality.")
     for row in rows:
-        await update.message.reply_text(
-            coin_card(row), parse_mode="HTML", reply_markup=mint_keyboard(row['mint']))
+        match = matches.get(row['mint'])
+        if match:
+            narrative = (f"\n🔥 <b>Possible narrative:</b> {esc(match['headline'][:95])}"
+                         f"\n🔗 Match words: {esc(match['evidence'])}"
+                         f"\n📰 <a href=\"{html.escape(match['url'], quote=True)}\">Headline source</a>"
+                         "\n⚪ Virality/causation unverified")
+        else:
+            narrative = "\n🌍 Narrative: no credible headline match recorded"
+        card = coin_card(row)
+        # Keep the contract and copy button at the bottom of each card.
+        mint_line = f"📋 <code>{esc(row['mint'])}</code>"
+        if mint_line in card:
+            card = card.replace(mint_line, narrative + "\n" + mint_line)
+        else:
+            card += narrative
+        await update.message.reply_text(card[:3900], parse_mode="HTML",
+                                        disable_web_page_preview=True,
+                                        reply_markup=mint_keyboard(row['mint']))
 
 
 async def topday(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -994,20 +1042,28 @@ async def narratives(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not authorized(update):
         return
     with conn() as db:
-        count = db.execute("SELECT COUNT(*) FROM narrative_matches").fetchone()[0]
-        rows = db.execute("""SELECT n.headline,n.url,n.evidence,n.overlap,
-             COUNT(*) AS coins,MAX(n.matched_at) AS last_seen
-             FROM narrative_matches n WHERE n.matched_at>?
-             GROUP BY n.url ORDER BY coins DESC,last_seen DESC LIMIT 6""",
+        records = db.execute("""SELECT n.mint,n.headline,n.url,n.evidence,
+             t.name,t.symbol,t.cap FROM narrative_matches n
+             LEFT JOIN tokens t ON t.mint=n.mint
+             WHERE n.matched_at>? ORDER BY n.matched_at DESC LIMIT 150""",
              (time.time()-86400,)).fetchall()
-    lines = [f"🌍 NARRATIVE WATCH (RSS evidence only)",
-             f"Historical coin/headline matches: {count}",
-             "Not verified viral; name overlap does not establish a connection."]
-    for r in rows:
-        lines.append(f"\n• {r['headline'][:90]}\n  {r['coins']} matching coin(s) · words: {r['evidence']}\n  {r['url']}")
+    rows = [r for r in records if narrative_match_valid(r['evidence'])][:6]
+    await update.message.reply_text(
+        "🌍 NARRATIVE WATCH — also included in /top.\n"
+        "RSS headline associations only; virality and causation unverified.")
     if not rows:
-        lines.append("No recent matches. Feeds may be unavailable or coin names unrelated.")
-    await update.message.reply_text("\n".join(lines)[:3900], disable_web_page_preview=True)
+        await update.message.reply_text("No credible recent headline/coin matches. Older generic-word matches are hidden.")
+        return
+    for r in rows:
+        lines = [f"🪙 <b>{esc(r['name'] or 'Unknown')} ({esc(r['symbol'] or '?')})</b>",
+                 f"💰 Cap: {esc(money(r['cap']))}",
+                 f"📰 {esc(r['headline'][:125])}",
+                 f"🔗 Match words: {esc(r['evidence'])}",
+                 f"📋 <code>{esc(r['mint'])}</code>",
+                 f"<a href=\"{html.escape(r['url'], quote=True)}\">Source headline</a>"]
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML",
+                                        disable_web_page_preview=True,
+                                        reply_markup=mint_keyboard(r['mint']))
 
 
 async def patterns(update: Update, context: ContextTypes.DEFAULT_TYPE):
