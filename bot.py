@@ -88,6 +88,10 @@ def init_db():
           sampled_at REAL NOT NULL, cap REAL, liquidity REAL,
           status TEXT NOT NULL, PRIMARY KEY(mint,stage));
         CREATE INDEX IF NOT EXISTS learning_due_idx ON learning_samples(stage,due_at);
+        CREATE TABLE IF NOT EXISTS launch_spike_samples (
+          mint TEXT NOT NULL, observed_at REAL NOT NULL, cap REAL NOT NULL,
+          liquidity REAL, PRIMARY KEY(mint,observed_at));
+        CREATE INDEX IF NOT EXISTS launch_spike_idx ON launch_spike_samples(mint,observed_at);
         CREATE TABLE IF NOT EXISTS wallet_evidence (mint TEXT PRIMARY KEY, checked_at REAL NOT NULL, evidence TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS learning_baselines (
           mint TEXT PRIMARY KEY, sampled_at REAL NOT NULL, cap REAL,
@@ -625,6 +629,43 @@ async def wallet_scan(client, mint):
     return result
 
 
+def record_launch_spike(mint, first_seen, cap, liquidity, observed_at):
+    """Store DEX observations only; don't equate valuation jumps with investment inflows."""
+    if cap is None or cap <= 0:
+        return
+    with conn() as db:
+        db.execute("INSERT OR IGNORE INTO launch_spike_samples(mint,observed_at,cap,liquidity) VALUES(?,?,?,?)",
+                   (mint, observed_at, cap, liquidity))
+
+
+def launch_spike_evidence(mint, first_seen):
+    """Find observed early DEX valuation jumps, not a verified first on-chain candle."""
+    with conn() as db:
+        samples = db.execute(
+            "SELECT observed_at,cap,liquidity FROM launch_spike_samples WHERE mint=? "
+            "ORDER BY observed_at ASC LIMIT 100", (mint,)).fetchall()
+    early = [r for r in samples if first_seen is not None and
+             first_seen - 15 <= r["observed_at"] <= first_seen + 120]
+    if not early:
+        return "UNOBSERVED", "No early DEX valuation observations; first candle unverified"
+    best = None
+    for i, a in enumerate(early):
+        for b in early[i+1:]:
+            elapsed = b["observed_at"] - a["observed_at"]
+            if elapsed <= 0 or elapsed > 90 or a["cap"] <= 0:
+                continue
+            ratio = b["cap"] / a["cap"]
+            if b["cap"] >= 400000 and ratio >= 4 and (best is None or ratio > best[0]):
+                best = (ratio, a, b, elapsed)
+    if best:
+        ratio, a, b, elapsed = best
+        return ("REVIEW", f"DEX valuation {money(a['cap'])} → {money(b['cap'])} "
+                f"({ratio:.1f}x in {elapsed:.0f}s); not proof of manipulation")
+    if early[0]["cap"] >= 400000:
+        return "HIGH_OPEN", f"First DEX observation already {money(early[0]['cap'])}; earlier trades unknown"
+    return "INCONCLUSIVE", f"{len(early)} early DEX observations; no qualifying observed 4x-to-$400K spike"
+
+
 def saved_wallet(mint):
     with conn() as db:
         row = db.execute("SELECT checked_at,evidence FROM wallet_evidence WHERE mint=?", (mint,)).fetchone()
@@ -775,10 +816,11 @@ async def worker(application, queue):
             # Avoid excessive provider polling: cap checks are spaced per token.
             with conn() as db:
                 rows = db.execute(
-                    "SELECT * FROM tokens WHERE state IN ('NEW','WAIT_CAP','HOLD','REJECT','EARLY_PENDING','EARLY_UNVERIFIED','EARLY_EXCLUDED') "
+                    "SELECT * FROM tokens WHERE (state IN ('NEW','WAIT_CAP','HOLD','REJECT','EARLY_PENDING','EARLY_UNVERIFIED','EARLY_EXCLUDED') "
+                    "OR (state='PRELIMINARY' AND first_seen>?)) "
                     "AND first_seen>? AND (updated_at IS NULL OR updated_at<?) "
                     "ORDER BY COALESCE(updated_at,0) ASC LIMIT 12",
-                    (time.time() - MAX_AGE, time.time() - MARKET_REFRESH_SECONDS)).fetchall()
+                    (time.time() - 120, time.time() - MAX_AGE, time.time() - MARKET_REFRESH_SECONDS)).fetchall()
             # Poll DEX markets concurrently: sequential 10-second timeouts could
             # consume the entire first-minute window for later launches.
             semaphore = asyncio.Semaphore(8)
@@ -798,6 +840,8 @@ async def worker(application, queue):
                 elif row["cap"] is None and row["launch_cap_sol"] is not None and sol_price is not None and time.time() - sol_price_at < 300:
                     cap = float(row["launch_cap_sol"]) * sol_price
                     source = "PumpPortal LAUNCH snapshot x SOL/USD (NOT live)"
+                if dex_cap is not None:
+                    record_launch_spike(mint, row["first_seen"], dex_cap, dex_liquidity, time.time())
                 # No first-minute cap gate: provider observations determine alerts.
                 # Previous EARLY_* rows are eligible for reprocessing.
                 with conn() as db:
@@ -807,7 +851,7 @@ async def worker(application, queue):
                         "cap_observed_at=CASE WHEN ? IS NOT NULL THEN ? ELSE cap_observed_at END,"
                         "liquidity=COALESCE(?,liquidity),"
                         "liquidity_observed_at=CASE WHEN ? IS NOT NULL THEN ? ELSE liquidity_observed_at END,"
-                        "updated_at=?,state='WAIT_CAP',early_high=0,early_dex_seen=0 WHERE mint=?",
+                        "updated_at=?,state=CASE WHEN state='PRELIMINARY' THEN state ELSE 'WAIT_CAP' END,early_high=0,early_dex_seen=0 WHERE mint=?",
                         (cap, source, source, cap, time.time() if cap is not None else None,
                          dex_liquidity, dex_liquidity, time.time() if dex_liquidity is not None else None,
                          time.time(), mint))
@@ -833,7 +877,7 @@ async def worker(application, queue):
                 # Only a current DEX observation can trigger further screening here.
                 # Launch snapshots are displayed for research but never treated as
                 # proof that a token has NOW crossed US$10,000.
-                if source != "DEX provider (recent poll)" or cap < CAP:
+                if source != "DEX provider (recent poll)" or cap < CAP or row["state"] == "PRELIMINARY":
                     continue
                 score, potential, category, state, reason = await inspect(client, mint, row, headlines)
                 with conn() as db:
@@ -946,6 +990,8 @@ def coin_card(row, pair=None, title=None, extra=None, detailed=False):
     if assessment:
         for warning in assessment["warnings"][:3]:
             lines.append(f"🔴 {esc(warning)}")
+    spike_status, spike_note = launch_spike_evidence(mint, row["first_seen"])
+    lines.append(f"🚀 Opening valuation: {esc(spike_status)} · {esc(spike_note)}")
     wallet_record = saved_wallet(mint)
     if wallet_record:
         w = wallet_record[0]
